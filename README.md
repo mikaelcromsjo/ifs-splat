@@ -75,8 +75,14 @@ browser viewer on another origin cannot fetch it. `root.md` has the nginx change
 
 ## Possible next
 
-- Export the compact 32-byte `.splat` format (≈1.2 MB at depth 7 vs 2.6 MB ply).
-- A WebGL viewer page so it has a URL.
+Design notes and the open questions are in [IDEAS.md](IDEAS.md): the direction (a geometric world
+rather than a forest), what generating the world on the fly gives for free, and **ordered
+generation** — emitting splats already in composite order, so the per-frame sort disappears.
+
+Nearer-term, smaller:
+
+- Export the compact 32-byte `.splat` format (~1.2 MB at depth 7 vs 2.6 MB ply).
+- A WebGL viewer page so it has a URL of its own.
 - The same construction for other IFS attractors; for escape-time fractals (Mandelbulb, quaternion
   Julia) there is no affine structure, so splat normals have to come from the distance estimator's
   gradient instead.
