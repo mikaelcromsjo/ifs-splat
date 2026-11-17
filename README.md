@@ -50,6 +50,19 @@ the node's already-placed Gaussian composes it outermost and squashes every bran
 toward the world origin — a floating canopy over a stub. That is why the recursion tracks the
 affine rather than the Gaussian.
 
+## Published
+
+    https://mikaelcromsjo.com/splat/tree.ply        # -d 7 -j 0.16 --seed 3, 38k splats, 2.6 MB
+
+Served straight from `/srv/sites/mikaelcromsjo/splat/` by that site's nginx vhost — no service and
+no root work, since its `location /` is a plain `try_files` over the web root. `.ply` is gitignored
+there, so the site repo stays clean. Regenerate or add more:
+
+    python3 ifs_tree_splat.py -o /srv/sites/mikaelcromsjo/splat/<name>.ply -d 7 -j 0.16
+
+The response has no `Access-Control-Allow-Origin`, so the URL works for a direct download but a
+browser viewer on another origin cannot fetch it. `root.md` has the nginx change that fixes it.
+
 ## Files
 
 | | |
