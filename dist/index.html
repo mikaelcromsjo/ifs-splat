@@ -1,0 +1,261 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>IFS splat</title>
+<style>
+  :root { color-scheme: dark; --ink:#e9edf3; --dim:#7f8898; --line:#20262f;
+          --acc:#7fd4a0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#070910; color:var(--ink);
+    font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    overflow:hidden; -webkit-font-smoothing:antialiased; }
+  #gl { position:fixed; inset:0; width:100%; height:100%; display:block;
+        touch-action:none; cursor:grab; }
+  #gl:active { cursor:grabbing; }
+  .panel { position:fixed; backdrop-filter:blur(10px);
+    background:rgba(9,12,18,.74); border:1px solid var(--line); border-radius:11px; }
+  #hud { top:14px; left:14px; padding:11px 13px; min-width:206px; }
+  #hud h1 { margin:0 0 7px; font-size:11px; letter-spacing:.17em;
+    text-transform:uppercase; color:var(--dim); font-weight:600; }
+  #hud table { border-collapse:collapse; width:100%; }
+  #hud td { padding:1px 0; white-space:nowrap; }
+  #hud td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  #hud td.k { color:var(--dim); padding-right:16px; }
+  #keys { bottom:14px; left:14px; padding:10px 13px; color:var(--dim);
+    max-width:min(92vw,620px); }
+  #keys b { color:var(--ink); font-weight:600; }
+  #keys .on { color:var(--acc); }
+  #keys .row { margin-top:3px; }
+  #split { position:fixed; top:0; bottom:0; left:50%; width:1px;
+    background:rgba(255,255,255,.2); display:none; }
+  #split.show { display:block; }
+  .tag { position:fixed; top:14px; padding:4px 10px; display:none;
+    background:rgba(9,12,18,.74); border:1px solid var(--line);
+    border-radius:999px; font-size:11px; letter-spacing:.05em; }
+  .tag.show { display:block; }
+  #tagL { left:calc(25% - 66px); } #tagR { left:calc(75% - 60px); }
+  #look { top:14px; right:14px; padding:11px 13px; min-width:150px; }
+  #look h1 { margin:0 0 7px; font-size:11px; letter-spacing:.17em;
+    text-transform:uppercase; color:var(--dim); font-weight:600; }
+  #look label { display:flex; align-items:center; gap:7px; padding:2px 0;
+    cursor:pointer; user-select:none; }
+  #look input { accent-color:var(--acc); margin:0; cursor:pointer; }
+  #look .hint { color:var(--dim); margin-top:7px; font-size:11px;
+    line-height:1.45; max-width:168px; }
+  #look hr { border:0; border-top:1px solid var(--line); margin:9px 0 7px; }
+  #look h2 { margin:0 0 5px; font-size:10.5px; letter-spacing:.15em;
+    text-transform:uppercase; color:var(--dim); font-weight:600; }
+  #look label.off { opacity:.38; cursor:not-allowed; }
+  #look .key { margin-left:auto; color:var(--dim); font-size:10.5px; }
+  #look button { width:100%; margin-top:6px; padding:4px 8px; cursor:pointer;
+    font:inherit; font-size:11px; color:var(--ink); border-radius:7px;
+    background:rgba(255,255,255,.06); border:1px solid var(--line); }
+  #look button:hover { background:rgba(255,255,255,.12); }
+  #err { position:fixed; inset:0; display:none; place-items:center; padding:28px;
+    text-align:center; color:#ff9f9f; white-space:pre-wrap; }
+</style>
+
+<canvas id="gl"></canvas>
+<div id="split"></div>
+<div class="tag" id="tagL">exact per-splat sort</div>
+<div class="tag" id="tagR">ordered expansion</div>
+
+<div class="panel" id="hud">
+  <h1 id="title">IFS splat</h1>
+  <table>
+    <tr><td class="k">splats</td><td id="n">—</td></tr>
+    <tr><td class="k">fps</td><td id="fps">—</td></tr>
+    <tr id="rOrd"><td class="k">order</td><td id="ord">—</td></tr>
+    <tr id="rEx"><td class="k">exact sort</td><td id="ex">—</td></tr>
+    <tr id="rExp"><td class="k">expand</td><td id="exp">—</td></tr>
+    <tr id="rDep"><td class="k">depth</td><td id="dep">—</td></tr>
+    <tr id="rSc"><td class="k">zoom</td><td id="sc">—</td></tr>
+    <tr id="rHere"><td class="k">inside</td><td id="here">—</td></tr>
+    <tr id="rFld"><td class="k">in view</td><td id="fld">—</td></tr>
+    <tr id="rMor"><td class="k">morph</td><td id="mor">—</td></tr>
+    <tr id="rInv"><td class="k">inversions</td><td id="inv">—</td></tr>
+  </table>
+</div>
+
+<div class="panel" id="keys">
+  <div class="row"><b>F</b> <span id="kF"></span>
+    &nbsp;·&nbsp; <b>M</b> <span id="kM"></span></div>
+  <div class="row" id="objKeys"><b>drag</b> orbit &nbsp;·&nbsp; <b>right-drag</b> pan
+    &nbsp;·&nbsp; <b>wheel</b> zoom &nbsp;·&nbsp;
+    <b>O</b> <span id="kO"></span> &nbsp;·&nbsp; <b>P</b> <span id="kP"></span></div>
+  <div class="row" id="flyKeys"><b>drag</b> look &nbsp;·&nbsp; <b>WASD/QE</b> fly
+    &nbsp;·&nbsp; <b>wheel</b> speed &nbsp;·&nbsp;
+    <b>space</b> <span id="kA"></span> &nbsp;·&nbsp; <b>R</b> restart</div>
+  <div class="row" id="note"></div>
+</div>
+
+<div class="panel" id="look">
+  <h1>controls</h1>
+  <h2>view</h2>
+  <label id="lFly"><input type="checkbox" id="optFly" checked> flight
+    <span class="key">F</span></label>
+  <label id="lAuto"><input type="checkbox" id="optAuto" checked> autopilot
+    <span class="key">space</span></label>
+  <label id="lAA"><input type="checkbox" id="optAA" checked> anti-alias
+    <span class="key">M</span></label>
+  <label id="lOrd"><input type="checkbox" id="optOrd" checked> ordered expansion
+    <span class="key">O</span></label>
+  <label id="lProof"><input type="checkbox" id="optProof"> proof panel
+    <span class="key">P</span></label>
+  <button id="optReset">restart flight <span class="key">R</span></button>
+  <hr>
+  <h2>look</h2>
+  <label><input type="checkbox" id="fxIrid" checked> iridescence</label>
+  <label><input type="checkbox" id="fxRim" checked> rim light</label>
+  <label><input type="checkbox" id="fxNeb" checked> nebula</label>
+  <label><input type="checkbox" id="fxStar" checked> stars</label>
+  <div class="hint" id="fxHint">&nbsp;</div>
+</div>
+
+<div id="err"></div>
+
+<script type="module">
+import { Viewer } from './js/viewer.js';
+
+const $ = (id) => document.getElementById(id);
+const show = (el, on) => { el.style.display = on ? '' : 'none'; };
+
+try {
+  const v = new Viewer($('gl'));
+  const ms = (x) => x.toFixed(2) + ' ms';
+
+  // The look toggles.  These are masters: each object already chose which
+  // effects it wants, and the mask is ANDed with that choice, so unticking a
+  // box here turns the effect off everywhere no matter what any object asked
+  // for.  Ticking it back does not turn it on everywhere -- objects that did
+  // not opt in stay plain, which is the point of having the mix.
+  const fxBoxes = ['fxIrid', 'fxRim', 'fxNeb', 'fxStar'];
+  // The star field's switch is its brightness, not a flag: the shader skips
+  // the whole nine-cell loop when it is zero, so off costs nothing.
+  const STARS = v.look.starAmt;
+  const syncFx = () => {
+    v.look.mask = ($('fxIrid').checked ? 1 : 0) | ($('fxRim').checked ? 2 : 0);
+    v.look.nebula = $('fxNeb').checked;
+    v.look.starAmt = $('fxStar').checked ? STARS : 0;
+    const on = fxBoxes.filter((id) => $(id).checked).length;
+    $('fxHint').textContent = on === 0
+      ? 'all off — plain palette colour'
+      : 'objects opt in individually; these switch off what they asked for';
+  };
+  for (const id of fxBoxes) $(id).addEventListener('change', syncFx);
+  syncFx();
+
+  // The view options.  These are the same state the keyboard has always
+  // driven, not a parallel copy of it: each box writes the viewer's own
+  // property and then asks it to re-publish its state, and syncView() below
+  // reads that state back.  So a keypress moves the boxes and a box does
+  // exactly what the keypress did -- there is no second source of truth to
+  // drift out of step.
+  $('optFly').addEventListener('change', () => {
+    v.scene = $('optFly').checked ? 'void' : 'object'; v.onstate();
+  });
+  $('optAuto').addEventListener('change', () => {
+    v.autopilot = $('optAuto').checked; v.onstate();
+  });
+  $('optAA').addEventListener('change', () => {
+    v.dilate = $('optAA').checked; v.onstate();
+  });
+  $('optOrd').addEventListener('change', () => {
+    v.mode = $('optOrd').checked ? 'ordered' : 'exact'; v.onstate();
+  });
+  $('optProof').addEventListener('change', () => {
+    v.proof = $('optProof').checked; v.onstate();
+  });
+  $('optReset').addEventListener('click', () => { v.resetFlight(); v.onstate(); });
+
+  // Which controls apply depends on the scene: the proof panel and the
+  // ordered/exact comparison are object-scene things, and the autopilot and
+  // restart only mean anything in flight.  Disabled rather than hidden, so
+  // the panel does not change height as you switch and the controls stay
+  // where your eye left them.
+  const syncView = () => {
+    const fly = v.scene === 'void';
+    $('optFly').checked = fly;
+    $('optAuto').checked = !!v.autopilot;
+    $('optAA').checked = !!v.dilate;
+    $('optOrd').checked = v.mode === 'ordered';
+    $('optProof').checked = !!v.proof;
+    const gate = (lab, box, on) => {
+      $(lab).className = on ? '' : 'off';
+      $(box).disabled = !on;
+    };
+    gate('lAuto', 'optAuto', fly);
+    gate('lOrd', 'optOrd', !fly);
+    gate('lProof', 'optProof', !fly);
+    $('optReset').disabled = !fly;
+    $('optReset').style.opacity = fly ? '' : '.38';
+  };
+
+  v.onstate = () => {
+    const fly = v.scene === 'void';
+    // The panel follows the viewer's state, whatever changed it -- a key, a
+    // box, or the viewer itself.
+    syncView();
+    $('title').textContent = fly ? 'IFS splat — flight' : 'IFS splat — object';
+    $('kF').textContent = fly ? 'flight' : 'single object';
+    $('kF').className = fly ? 'on' : '';
+    $('kM').textContent = v.dilate ? 'anti-alias on' : 'anti-alias OFF';
+    $('kM').className = v.dilate ? 'on' : '';
+    $('kO').textContent = v.mode === 'ordered' ? 'ordered expansion' : 'exact sort';
+    $('kO').className = v.mode === 'ordered' ? 'on' : '';
+    $('kP').textContent = v.proof ? 'proof panel on' : 'proof panel';
+    $('kP').className = v.proof ? 'on' : '';
+    $('kA').textContent = v.autopilot ? 'autopilot on' : 'autopilot off';
+    $('kA').className = v.autopilot ? 'on' : '';
+    const p = v.proof && !fly;
+    $('split').className = p ? 'show' : '';
+    $('tagL').className = p ? 'tag show' : 'tag';
+    $('tagR').className = p ? 'tag show' : 'tag';
+    show($('objKeys'), !fly);
+    show($('flyKeys'), fly);
+    show($('rOrd'), !fly);
+    show($('rEx'), !fly);
+    show($('rExp'), fly);
+    show($('rDep'), fly);
+    show($('rSc'), fly);
+    show($('rHere'), fly);
+    show($('rFld'), fly);
+    show($('rMor'), fly);
+    show($('rInv'), !fly && v.proof);
+    $('note').textContent = p
+      ? 'left: every splat depth-sorted. right: ordered expansion — no sort, '
+      + 'five dot products and nine compare-swaps per node. the inversion '
+      + 'figure is the fraction of splat pairs drawn in the wrong order, '
+      + 'weighted by both opacities.'
+      : '';
+  };
+  v.onstate();
+
+  let wasFlight = v.scene === 'void';
+  setInterval(() => {
+    if ((v.scene === 'void') !== wasFlight) { wasFlight = !wasFlight; v.onstate(); }
+    $('n').textContent = v.stats.splats.toLocaleString();
+    $('fps').textContent = v.stats.fps.toFixed(0);
+    $('ord').textContent = v.stats.order ? ms(v.stats.order) : '—';
+    $('ex').textContent = v.stats.exact ? ms(v.stats.exact) : '—';
+    $('exp').textContent = v.stats.expand ? ms(v.stats.expand) : '—';
+    $('dep').textContent = v.stats.depth;
+    $('here').textContent = v.stats.here || '—';
+    $('mor').textContent = v.stats.morph ? ms(v.stats.morph) : 'held';
+    $('fld').textContent = v.stats.resident == null ? '—'
+      : `${v.stats.visible} of ${v.stats.resident}`;
+    $('inv').textContent = v.stats.inversion == null ? '—'
+      : (v.stats.inversion * 100).toFixed(1) + '%';
+    $('sc').textContent = v.stats.scale < 1
+      ? (1 / v.stats.scale).toExponential(1).replace('e+', '×10^') + '×'
+      : '1×';
+  }, 250);
+
+  v.start();
+  window.viewer = v;
+} catch (e) {
+  $('err').style.display = 'grid';
+  $('err').textContent = e.message;
+  console.error(e);
+}
+</script>
