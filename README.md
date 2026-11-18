@@ -1,88 +1,185 @@
+<div align="center">
+
+<img src="docs/hero.png" alt="A fractal attractor seen from inside, under a nebula" width="880">
+
 # ifs-splat
 
-Fractal trees as 3D Gaussian splats, generated directly from an IFS — no skeleton, no point
-sampling, no training. Output is a standard 3DGS `.ply` that SuperSplat, antimatter15/splat,
-Nerfstudio or Postshot will open.
+### Fractal worlds as 3-D Gaussian splats — straight from the equations
 
-![depth 8, jittered](preview.png)
+No scan, no training, no point cloud, no file. An iterated function system *is* the model, and the
+splats are generated in draw order, every frame, as far in as you care to fly.
 
-## Run
+[**▶ Live demo**](https://mikaelcromsjo.com/splat/) &nbsp;·&nbsp;
+[What is built](STATUS.md) &nbsp;·&nbsp;
+[Design notes](IDEAS.md) &nbsp;·&nbsp;
+[Every measurement](MEASURED.md)
 
-    python3 ifs_tree_splat.py -o tree.ply -d 7              # 38k splats, the exact attractor
-    python3 ifs_tree_splat.py -o tree.ply -d 8 -j 0.16      # 153k splats, organic
+</div>
 
-    python3 render_check.py tree.ply check.png              # eyeball it without a viewer
+---
 
-numpy only. `-d` is branch recursion depth; splat count is about `5/3 · 4^depth`.
-`--up` is the viewer's up-axis (`-y` by default); try `y` or `z` if the tree loads sideways.
+## The whole idea, in one line
+
+An affine map of a Gaussian is a Gaussian, in closed form:
+
+```
+w(x) = A x + b      ⟹      N(μ, Σ)  ⟶  N(A μ + b,  A Σ Aᵀ)
+```
+
+So an IFS acts on *splats* directly. Every node of the recursion carries its accumulated affine
+`(A, b)`; its Gaussian is `A·Σ₀·Aᵀ` whenever someone asks. The composed linear part is the
+fractal's own Jacobian along that address — which is why the splats stretch along the local branch
+direction without anything ever computing a branch direction.
+
+That is the entire representation. There is no geometry stored anywhere: a few dozen numbers
+define a world you can fly through for as long as you like.
+
+<div align="center"><img src="docs/gallery.png" alt="Ten map sets" width="880"></div>
+
+<div align="center"><sub>Ten map sets, one engine, no special cases — a tree is four maps with a
+trunk mass fraction, a Sierpinski tetrahedron is four maps with that fraction at zero.</sub></div>
+
+## What it does
+
+- **Generates splats in draw order.** No per-frame sort. The expansion emits back-to-front by
+  construction, and the error from that approximate order is about a third of the camera's own
+  frame-to-frame change, at every percentile including the single worst pixel.
+- **Zooms without bottom.** The camera re-roots into whichever node it is inside, so depth is
+  unbounded: **depth 52, eleven orders of magnitude**, with a round trip through world
+  coordinates exact to one float64 ulp.
+- **Adapts its level of detail** to a splat budget and cross-fades what it drops — 26–44 dB
+  against a fully expanded ground truth at 2–12× fewer splats.
+- **Fills an endless field.** Attractors are placed by hashing where you are, in a hierarchy whose
+  cells are provably disjoint: 1.5M pair tests across a 240 s flight, zero intersections, while
+  everything drifts, breathes and turns.
+- **Morphs while you fly**, along a closed C¹ spline through the map sets, at **the display's
+  frame rate** rather than the rebuild rate — the shape between two rebuilds is a lerp done *as
+  the traversal reads the table*, which costs +3.8% on the frame.
+- **Flies itself** — a slow autopilot that dives along the attractor's boundary rather than into
+  its mass, banks into its turns and climbs back out, under a nebula whose stars are band-limited
+  the same way the splats are, so nothing crawls when the scale changes by factors of ten.
+
+<div align="center"><img src="docs/morph.png" alt="Eight steps along the morph spline" width="880"></div>
+
+<div align="center"><sub>Eight steps along the closed spline through shape space — tree to fern to
+sheet, geometry and palette on the same path. In the demo this runs continuously, at the
+display's frame rate.</sub></div>
+
+<div align="center"><img src="docs/flight.png" alt="Frames from an autopilot flight" width="880"></div>
+
+<div align="center"><sub>Six frames from one 60-second flight, chosen off a contact sheet of the
+whole run — the stretches in between are mostly void, which is the fault the autopilot is still
+being measured against. Every image here is drawn by a CPU rasteriser, for the reason
+below.</sub></div>
+
+## A caveat that belongs near the top
+
+**No GPU code here has ever been executed.** There is no browser on the machine this was built on:
+no WebGL run, no screenshot from a real device, no measured frame time. The shaders are checked by
+transcribing them to the CPU and comparing against the Python reference, which pins the arithmetic
+and says nothing about whether they compile. The compute kernel reproduces the CPU expansion with
+**0 wrong draw slots out of 114,687** — a statement about arithmetic, not about drivers.
+
+Everything else in [MEASURED.md](MEASURED.md) was measured headlessly, with a CPU rasteriser that
+is a line-by-line twin of the shader.
+
+## Run it
+
+The demo is `web/`: `index.html` plus ES modules. No build step, no server code.
+
+```sh
+cd web && python3 -m http.server 8000      # then open http://localhost:8000/
+```
+
+**F** switches between the endless field and the single object · **P** opens the proof panel ·
+**space** takes the autopilot off · the panel on the right toggles iridescence, rim light, nebula
+and stars. `dist/` is the same demo with the test-only modules stripped, ready to drop on any
+static host.
+
+The original exporter writes a standard 3DGS `.ply` that SuperSplat, antimatter15/splat,
+Nerfstudio or Postshot will open — numpy only:
+
+```sh
+python3 ifs_tree_splat.py -o tree.ply -d 7               # 38k splats, the exact attractor
+python3 ifs_tree_splat.py -o tree.ply -d 8 -j 0.16       # 153k splats, organic
+python3 render_check.py tree.ply check.png               # eyeball it without a viewer
+```
+
+## How it is checked
+
+With no browser, every claim has to be made by a program that draws the picture itself:
+
+```sh
+cd web
+node tests/tour.mjs 150 out/tour.png   # fly the whole demo for 150 s, as a filmstrip
+node tests/legible.mjs 120 280 210 1   # is there anything to SEE, or is it a fog bank?
+node tests/breath.mjs                  # the morph: C¹, breathing, at display rate, in budget
+node tests/field.mjs                   # the field: disjoint cells, budget, eviction, motion
+node tests/fidelity.mjs                # the level of detail against ground truth
+node tests/gpu_transcribe.mjs 7        # the compute kernel against the CPU expansion
+node tests/reroot.mjs                  # unbounded zoom, and the round trip through world space
+node tests/pilot.mjs                   # what the dive aims at, and what banking does
+node tests/space.mjs                   # the sky, and whether its stars crawl
+```
+
+The flight is chaotic by construction — perturb the camera speed by one part in a million and the
+heading is 60° away three seconds later — so tests that touch it assert *mechanism*, and the
+probes that measure outcome take a seed and are compared in pairs.
 
 ## Why it works
 
-An affine map applied to a Gaussian is a Gaussian, in closed form:
-
-    w(x) = A x + b      =>      N(mu, S)  ->  N(A mu + b,  A S A^T)
-
-So the IFS acts on splats directly. Each node of the recursion carries its accumulated affine
-`(A, b)`; its Gaussian is `A·SIG0·A^T` on demand. The composed linear part is the fractal's own
-Jacobian along that address, which is why the splats stretch along the local branch direction
-without anything computing branch directions.
-
-Four design points carry the whole thing:
+Four design points carry the tree:
 
 - **The trunk map is terminal.** It squashes a whole tree copy into one thin rod, so recursing
-  into it only re-tiles the same rod (and multiplies the splat count ~250×). One rod per node is
-  the branch segment — the skeleton's geometry, without a skeleton.
-- **The trunk map's z factor is exactly `1 - s`**, so a rod's top lands on its children's attach
+  into it only re-tiles the same rod. One rod per node is the branch segment — the skeleton's
+  geometry, without a skeleton.
+- **The trunk map's z factor is exactly `1 − s`**, so a rod's top lands on its children's attach
   height. Branches emerge from the end of the parent segment with no tuning.
-- **`SIG0` is the tree's bounding ellipsoid**, so the trunk map's lateral squash (0.075) sets the
-  trunk radius directly — about 1/37 of height.
-- **Branch maps contract uniformly**, giving `S -> s² R S R^T`: elongation rotates onto each
-  branch's own axis, so no map is rank-deficient and the degenerate needle covariances that a
-  Barnsley-style rank-deficient stem map produces never appear.
+- **`Σ₀` is the tree's bounding ellipsoid**, so the trunk map's lateral squash sets the trunk
+  radius directly — about 1/37 of height.
+- **Branch maps contract uniformly**, giving `Σ → s² R Σ Rᵀ`: elongation rotates onto each
+  branch's own axis, so no map is rank-deficient and the degenerate needle covariances of a
+  Barnsley-style stem map never appear.
 
-Wood and foliage need no modeling: any address containing the trunk map is wood, pure-branch
-addresses are the canopy (reshaped into discs, flat along the branch axis).
+Wood and foliage need no modelling: any address containing the trunk map is wood, pure-branch
+addresses are canopy.
 
-### Watch out for
+> **Watch out for:** the trunk map has to compose in each node's **local** frame
+> (`w_path ∘ w_trunk`). Applied to the node's already-placed Gaussian it composes outermost and
+> squashes every branch rod back toward the world origin — a floating canopy over a stub. That is
+> why the recursion tracks the affine rather than the Gaussian.
 
-The trunk map has to compose in each node's **local** frame (`w_path ∘ w_trunk`). Applying it to
-the node's already-placed Gaussian composes it outermost and squashes every branch rod back
-toward the world origin — a floating canopy over a stub. That is why the recursion tracks the
-affine rather than the Gaussian.
-
-## Published
-
-    https://mikaelcromsjo.com/splat/tree.ply        # -d 7 -j 0.16 --seed 3, 38k splats, 2.6 MB
-
-Served straight from `/srv/sites/mikaelcromsjo/splat/` by that site's nginx vhost — no service and
-no root work, since its `location /` is a plain `try_files` over the web root. `.ply` is gitignored
-there, so the site repo stays clean. Regenerate or add more:
-
-    python3 ifs_tree_splat.py -o /srv/sites/mikaelcromsjo/splat/<name>.ply -d 7 -j 0.16
-
-The response has no `Access-Control-Allow-Origin`, so the URL works for a direct download but a
-browser viewer on another origin cannot fetch it. `root.md` has the nginx change that fixes it.
-
-## Files
+## The repository
 
 | | |
 |---|---|
-| `ifs_tree_splat.py` | the generator; the IFS is the `BRANCH` / `TRUNK_A` block at the top |
+| `web/` | the demo — `index.html`, ES modules, and the headless suite that checks it |
+| `dist/` | the same demo with test-only modules stripped, for a static host |
+| `ifs_tree_splat.py` | the exporter; the IFS is the `BRANCH` / `TRUNK_A` block at the top |
 | `render_check.py` | minimal orthographic splat rasteriser (numpy + zlib), writes a PNG |
-| `preview.png` | `-d 8 -j 0.16 --seed 3` |
+| `py/` | the offline studies the engine decisions were made from |
+| [`STATUS.md`](STATUS.md) | what is built, what is measured, what is not done |
+| [`IDEAS.md`](IDEAS.md) | design notes, open questions, and which predictions failed |
+| [`MEASURED.md`](MEASURED.md) | every claim, with the test that produced it |
+| [`PLAN.md`](PLAN.md) | what it was built against |
 
-`.ply` output is gitignored — it regenerates in a few seconds.
+## Next
 
-## Possible next
+- Turn the dive around where projected detail peaks rather than at `maxDepth` — still the largest
+  single win available, and the climb back out is still the worst stretch of the flight.
+- Write the WebGPU host code. The kernel and its binding layout exist and are checked against the
+  CPU expansion; nothing wires them to a device.
+- Adaptive expansion on the GPU: the kernel is uniform-depth, and under an LOD cut you do not know
+  a subtree's size until you have walked it.
+- The same construction for other IFS attractors. For escape-time fractals (Mandelbulb, quaternion
+  Julia) there is no affine structure, so splat covariance has to come from the distance
+  estimator's gradient instead.
 
-Design notes and the open questions are in [IDEAS.md](IDEAS.md): the direction (a geometric world
-rather than a forest), what generating the world on the fly gives for free, and **ordered
-generation** — emitting splats already in composite order, so the per-frame sort disappears.
+---
 
-Nearer-term, smaller:
+<div align="center"><sub>
 
-- Export the compact 32-byte `.splat` format (~1.2 MB at depth 7 vs 2.6 MB ply).
-- A WebGL viewer page so it has a URL of its own.
-- The same construction for other IFS attractors; for escape-time fractals (Mandelbulb, quaternion
-  Julia) there is no affine structure, so splat normals have to come from the distance estimator's
-  gradient instead.
+Built by measuring. Where a measurement contradicted the plan, the plan is still in
+[IDEAS.md](IDEAS.md), with the number that beat it.
+
+</sub></div>

@@ -1,3 +1,5 @@
 *.ply
 *.splat
 out/
+__pycache__/
+*.pyc
