@@ -661,6 +661,57 @@ screen, which looked like most of the churn. A two-place dead band turned 137 re
 into 142 — nothing, because rank drifts steadily through all eight positions as the camera flies,
 so a dead band delays a re-cut rather than preventing it. Not shipped.
 
+#### And the next one needs a witness, so the moment is a link
+
+Every number above was measured here, headless, over a flight this machine drove itself. None of
+it can answer *"it went jumpy just then"*, and that is the form the next report will take, because
+the only instrument pointed at the real thing is somebody's eye. A frame number cannot close the
+gap either: the autopilot integrates real frame times and `tests/pilot.mjs` establishes that the
+dive is chaotic -- one part in a million of speed puts the heading 60 degrees away in three
+seconds -- so frame 4213 in a browser names a state that cannot be reached again from here.
+
+So the page carries the state instead of pointing at it. **J**, or the panel's button, writes one
+frame of the simulation into the URL fragment and copies the link.
+
+What makes that cheap is the thing the whole engine is built on: every heavy array is a pure
+function of a few parameters. A slot draws from two premultiplied child tables of 288 KB each,
+and both of them are `premul(build(morphPath(u)), jitter table at bits, seed + k)` -- or, while a
+resize migrates, the same build with the jitter rotations blended at weight `_migW`, which is
+again a function of `(u, bits, migLo, migW, grow)`. Ten numbers a slot. The jitter axes come from
+the entry index alone, so the seed fixes them; the palette is a function of `u`; the field's cells
+are a hash of where the camera is. **20 KB of JSON, 7 KB of link** after gzip, for the pool, all
+eight slots, the camera, the view settings, and the 90 frames before the keypress.
+
+The window is there for one reason: a hand takes about three tenths of a second, which is eighteen
+frames, so a snapshot of the present frame is a snapshot of the aftermath. Ninety frames at 60 Hz
+is a second and a half and holds about ten rebuilds per slot, which is what lets a replay cross
+the hand-overs rather than just sweep a fraction between two fixed builds. Per frame it carries
+each slot's blend fraction and the splat movement its own probe measured, plus the frame's cost
+and the splat count -- because three of the four things that look like a jump are not the morph at
+all, and a 200 ms frame (twelve frames of motion at once) or a quarter of the splats changing is
+answerable from the link alone.
+
+`tests/mark.mjs` is the other half, and it does not trust itself. Every rebuild in the window
+carries the state the browser reached -- mask, migration weight, which entries were still merging,
+whether the mask drop was still pending -- and the replay drives the same `reparam()` with the
+same requests and is checked against all of it, then against the browser's own per-frame splat
+movement. Measured on a flight with the ramp switched off, so that there is a real jump in the
+window to reproduce: **every one of 11 rebuild records reproduced exactly, and the replayed splat
+movement matched the recorded movement to 0.005% at p50 and 0.017% at worst.** Only then does it
+draw: a filmstrip of the frames either side of the worst one.
+
+The live probe is `tests/drift.mjs`'s measurement at frame rate -- 8 fixed addresses at depth 3
+per slot, 192 node compositions, against the 24 at depth 4 the offline test can afford -- with
+each slot's own median step as the yardstick, which is what makes one threshold fit eight objects
+of different sizes. The A/B that says it works is the fault this stage already fixed: over 900
+frames with the resize **switched** it reads **212.6x the slot's median and flags 30 frames**;
+with it **ramped**, **3.4x and nothing**. Cost **0.105 ms a frame** for eight slots, against the
+1.5 ms the rebuild budget alone is allowed, so it stays on.
+
+And the HUD prints `frame` and `worst jump` continuously, which makes the quiet answer available
+too: if a minute of flying leaves `worst jump` at 2x, the morph is saying it is not what is being
+complained about, and that is worth as much as finding a jump.
+
 ### The climb does not arc any more
 
 Measured, 200 s each (`tests/legible.mjs`): arcing out of a dive rather than reversing back up the

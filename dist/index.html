@@ -90,6 +90,8 @@
     <tr id="rMor"><td class="k">morph cost</td><td id="mor">—</td></tr>
     <tr id="rMHz"><td class="k">morph fps</td><td id="mhz">—</td></tr>
     <tr id="rRHz"><td class="k">rebuild fps</td><td id="rhz">—</td></tr>
+    <tr id="rFrm"><td class="k">frame</td><td id="frm">—</td></tr>
+    <tr id="rJmp"><td class="k">worst jump</td><td id="jmp">—</td></tr>
     <tr id="rInv"><td class="k">inversions</td><td id="inv">—</td></tr>
     <tr><td class="k">build</td><td id="build">—</td></tr>
   </table>
@@ -144,6 +146,8 @@
   <label id="lMorph"><input type="checkbox" id="optMorph" checked> morphing</label>
   <label id="lInterp"><input type="checkbox" id="optInterp" checked> interpolate</label>
   <div class="hint" id="morphHint">&nbsp;</div>
+  <button id="optMark">copy a link to this moment <span class="key">J</span></button>
+  <div class="hint" id="markHint">&nbsp;</div>
   <hr>
   <a class="btn" id="about" href="https://claude.ai/artifact/GRiwEV6yX8nvA4uiSZeEKd"
      target="_blank" rel="noopener">how it works &#8599;</a>
@@ -197,6 +201,8 @@ fetch(location.href, { cache: 'no-store' })
 
 try {
   const v = new Viewer($('gl'));
+  // So a pasted log says which copy of the demo produced it.
+  v.jumpLog.build = BUILD;
   const ms = (x) => x.toFixed(2) + ' ms';
 
   // The look toggles.  These are masters: each object already chose which
@@ -264,6 +270,19 @@ try {
     v.interpolate = $('optInterp').checked; v.onstate();
   });
 
+  // "It jumped -- there." The one thing no measurement on this side of the
+  // screen can know is WHEN somebody saw something, so this is the only
+  // control in the panel whose job is to record a human reaction. What it
+  // produces is a link: the state of the simulation and the second and a
+  // half before it, packed into the URL fragment by js/snapshot.js, exact
+  // enough for tests/mark.mjs to rebuild the frame and draw it.
+  // The hint is written by syncView below, not here, so that the J key and
+  // this button say the same thing -- same discipline as every other control
+  // in this panel: change the viewer's state, then let it re-publish.
+  $('optMark').addEventListener('click', () => v.markJump());
+  $('markHint').textContent = 'see something jump? press J — it copies a link '
+    + 'that holds this exact frame of the simulation, so it can be replayed';
+
   // Which controls apply depends on the scene: the proof panel and the
   // ordered/exact comparison are object-scene things, and the autopilot and
   // restart only mean anything in flight.  Disabled rather than hidden, so
@@ -292,6 +311,12 @@ try {
     gate('lProof', 'optProof', !fly);
     $('optReset').disabled = !fly;
     $('optReset').style.opacity = fly ? '' : '.38';
+    $('optMark').disabled = !fly;
+    $('optMark').style.opacity = fly ? '' : '.38';
+    if (v.mark)
+      $('markHint').textContent = `frame ${v.mark.frame} — a link to this `
+        + `moment is on the clipboard (${(v.mark.bytes / 1024).toFixed(1)} kB) `
+        + `and in the URL bar and the console. Send it back.`;
     // The ladder is the adaptive walk's budget, and the single object does not
     // run the adaptive walk -- it is one fixed expansion. Gated off there
     // rather than hidden, like everything else that does not apply.
@@ -347,6 +372,8 @@ try {
     show($('rMor'), fly);
     show($('rMHz'), fly);
     show($('rRHz'), fly);
+    show($('rFrm'), fly);
+    show($('rJmp'), fly);
     show($('rInv'), !fly && v.proof);
     $('note').textContent = p
       ? 'left: every splat depth-sorted. right: ordered expansion — no sort, '
@@ -380,6 +407,13 @@ try {
       : v.interpolate
         ? `the drawn shape moves ${sHz.toFixed(0)}×/s from ${rHz.toFixed(1)} rebuilds/s`
         : `the drawn shape steps at the rebuild rate, ${rHz.toFixed(1)}×/s`;
+    $('frm').textContent = v.stats.frameNo ? v.stats.frameNo.toLocaleString() : '—';
+    // The worst single frame any slot has had, as a multiple of that slot's
+    // own ordinary frame. Near 1 means the morph is moving evenly; the fault
+    // this probe was written to catch read 86x.
+    $('jmp').textContent = v.stats.jump
+      ? `${v.stats.jump.toFixed(1)}×` + (v.stats.jumps ? ` (${v.stats.jumps})` : '')
+      : '—';
     $('fld').textContent = v.stats.resident == null ? '—'
       : `${v.stats.visible} of ${v.stats.resident}`;
     $('inv').textContent = v.stats.inversion == null ? '—'

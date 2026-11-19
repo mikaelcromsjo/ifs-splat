@@ -17,6 +17,8 @@ import { InversionCounter } from './inversions.js';
 import { vertexSource, FRAG, BG_VERT, BG_FRAG } from './shaders.js';
 import { AdaptiveStream, PALETTES } from './adaptive.js';
 import { World, FieldWorld, VoidCamera, Autopilot, ringLayout } from './world.js';
+import { JumpLog } from './mark.js';
+import { link as snapLink } from './snapshot.js';
 import { SET_NAMES } from './maps.js';
 
 const TEX_W = 2048;
@@ -205,7 +207,18 @@ export class Viewer {
                    // measured live. With interpolation on the first should
                    // sit on the frame rate and the second far below it --
                    // which is the claim the panel is now making in public.
-                   shapeHz: 0, rebuildHz: 0 };
+                   shapeHz: 0, rebuildHz: 0,
+                   // The frame counter the viewer can quote back, and what
+                   // the probe in js/mark.js has seen of the morph. `jump`
+                   // is the worst single frame as a multiple of that slot's
+                   // own ordinary frame -- a number that stays near 1 is the
+                   // morph saying it is not the thing being complained
+                   // about, which is as useful as a jump would be.
+                   frameNo: 0, jumps: 0, jump: 0 };
+    // The live probe. One per viewer rather than one per flight: a restart
+    // re-attaches it (see resetFlight), and keeping the same object means
+    // whatever the viewer has already quoted stays quotable.
+    this.jumpLog = new JumpLog({ build: this.opts.build ?? 'dev' });
     this._frames = 0; this._t0 = performance.now(); this._last = this._t0;
     this.keys = new Set();
 
@@ -504,6 +517,45 @@ export class Viewer {
     return this.detail;
   }
 
+  /**
+   * "It is happening now" -- the viewer's own mark, on J or on the button.
+   *
+   * What it produces is a LINK: js/snapshot.js packs the state of the
+   * simulation, plus the second and a half of per-slot history before this
+   * frame, into the URL fragment. The fragment is an exact description of
+   * the moment -- every table in the engine is a pure function of a handful
+   * of parameters -- so tests/mark.mjs can rebuild it offline and draw it.
+   * A frame number could not do that: this flight is not reproducible.
+   *
+   * The URL bar is updated with replaceState rather than by assigning to
+   * location.hash, which would push a history entry per mark and make the
+   * back button walk through them.
+   *
+   * The clipboard is attempted because it is the only way most people will
+   * move a link, and the console line is unconditional because the clipboard
+   * needs a permission and a secure context, and silence would look like
+   * nothing happened.
+   */
+  async markJump(note = '') {
+    const pool = this.world && this.world.pool;
+    if (!pool) return null;
+    this.jumpLog.mark(pool, this._env || {}, note);
+    const L = await snapLink(this);
+    if (!L) return null;
+    this.mark = { frame: this.jumpLog.frame, url: L.url, bytes: L.frag.length };
+    this.stats.marks = (this.stats.marks ?? 0) + 1;
+    try { history.replaceState(null, '', '#' + L.frag); } catch (_) {}
+    console.log(this.jumpLog.text(pool));
+    console.log(`ifs-splat mark — frame ${this.jumpLog.frame}, `
+              + `${L.frag.length} chars. Send this link:\n${L.url}`);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText)
+        await navigator.clipboard.writeText(L.url);
+    } catch (_) { /* no clipboard: the console line is the copy */ }
+    if (this.onstate) this.onstate();
+    return L.url;
+  }
+
   // ------------------------------------------------------------ interaction
 
   bindEvents() {
@@ -555,6 +607,9 @@ export class Viewer {
       else if (k === 'm') this.dilate = !this.dilate;
       else if (k === ' ') this.autopilot = !this.autopilot;
       else if (k === 'r') this.resetFlight();
+      // J for "jumped". Deliberately not a modifier chord: it has to be
+      // pressable in the half second after something is seen.
+      else if (k === 'j') this.markJump();
       // Detail, on the keys that every other viewer puts it on. '=' as well as
       // '+', because '+' is a shifted key and nobody holds shift for it.
       else if (k === '-' || k === '_') this.setDetail(this.detail - 1);
@@ -762,6 +817,19 @@ export class Viewer {
     this.stats.resident = this.world.length;
     this.stats.visible = this.world.visible;
     this.stats.phase = this.pilot.phase;
+
+    // The morph probe, after the stats so it can carry them, and after
+    // world.update so the tables it reads are the ones just drawn from.
+    // Field worlds only: the ring world has no pool.
+    const env = { dt: (dt * 16.67), splats: n, depth: cam.depth,
+                  visible: this.world.visible, resident: this.world.length };
+    this._env = env;
+    if (this.world.pool) {
+      this.jumpLog.tick((dt * 16.67) / 1000, this.world.pool, env);
+      this.stats.frameNo = this.jumpLog.frame;
+      this.stats.jumps = this.jumpLog.jumps;
+      this.stats.jump = this.jumpLog.worst;
+    }
 
     // Before the splats, and before the early return below: an empty frame
     // is exactly the frame that most needs a background that is not flat.

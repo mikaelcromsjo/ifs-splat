@@ -96,8 +96,16 @@ cd web && python3 -m http.server 8000      # then open http://localhost:8000/
 and stars, and switches the morph and its interpolation on and off while the HUD shows what each
 costs: *morph fps* is how often the drawn shape actually changes, *rebuild fps* how often it is
 rebuilt. Unticking **interpolate** collapses the first onto the second, which is the judder the
-interpolation exists to remove, visible side by side with its own number. `dist/` is the same demo with the test-only modules stripped, ready to drop on any
-static host.
+interpolation exists to remove, visible side by side with its own number.
+
+**J** copies a link. Its fragment holds the exact frame of the simulation you are looking at --
+the pool, every slot's build parameters, the camera, and the second and a half before you pressed
+it -- because a frame number would not: the autopilot integrates real frame times and the dive is
+chaotic, so a moment in a browser cannot be re-reached from a number. Send the link and
+`node tests/mark.mjs '<link>'` rebuilds that frame offline, checks the reconstruction against what
+the page measured, and draws the frames either side of the worst one.
+
+`dist/` is the same demo with the test-only modules stripped, ready to drop on any static host.
 
 The original exporter writes a standard 3DGS `.ply` that SuperSplat, antimatter15/splat,
 Nerfstudio or Postshot will open — numpy only:
@@ -120,6 +128,8 @@ node tests/breath.mjs                  # the morph: C¹, breathing, at display r
 node tests/toggles.mjs                 # the morph switches, and the rates the panel shows
 node tests/secant.mjs                  # what the read-time blend misses, against an exact build
 node tests/drift.mjs                   # drawn splat positions against an exact build
+node tests/mark.mjs                    # the J-key snapshot: round trip, replay, and the A/B
+                                       # that says the live probe can see a known jump
 node tests/field.mjs                   # the field: disjoint cells, budget, eviction, motion
 node tests/fidelity.mjs                # the level of detail against ground truth
 node tests/gpu_transcribe.mjs 7        # the compute kernel against the CPU expansion

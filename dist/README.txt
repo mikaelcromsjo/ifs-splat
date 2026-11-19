@@ -10,6 +10,14 @@ rather than scattered from a snapshot that stopped being taken while it was off;
 resize now lands with the rebuild that fills it instead of at the moment it is asked for; and the
 extrapolation bound is taken from the pair it belongs to.
 
+Republished 2026-11-19 with the jitter-table resize ramped over four rebuilds rather than
+switched (it was the largest remaining jump in the morph, 86x an ordinary frame's own motion),
+a link to the write-up on the panel, and the J key: it copies a URL whose fragment holds the
+exact frame of the simulation you are looking at -- the pool, all eight slots' build parameters,
+the camera, and the 90 frames before the keypress -- so a moment seen in a browser can be sent
+back and replayed offline with `node tests/mark.mjs '<link>'`.  js/mark.js is the live probe
+behind it and js/snapshot.js the packer; both are browser-only code with no node imports.
+
 The published copy no longer carries cpu_raster.js, gpu_ref.js or calibrate.js: they had been
 copied up with the rest on the first publish, and cpu_raster.js imports node:zlib, so a browser
 that ever loaded it would have failed.  Nothing references them; they are removed.
