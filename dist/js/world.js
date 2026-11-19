@@ -359,6 +359,13 @@ export class FieldWorld {
     this.items = new Map();                 // cell key -> Placed
     this.reparamMs = 0;
     this.visible = 0;
+    // `morphing` and `interpolate` live on the pool, which is where the
+    // machinery is; these are accessors onto it (below) rather than a second
+    // copy of the flag. A world that kept its own and gated the pool's
+    // update() would be the obvious way to write it and the wrong one: the
+    // pool would then stop being called at all, and its rate meters -- the
+    // numbers the panel shows -- would hold whatever they said when the
+    // morph was switched off instead of falling to zero.
     this.morphing = opts.morphing ?? true;
     // Objects drift, breathe and turn. Separate from `morphing`, which is the
     // shapes changing: a field can do either without the other, and the tests
@@ -421,12 +428,25 @@ export class FieldWorld {
    * see closely is rebuilt last.  One frame of lag is invisible against a
    * fourteen-second morph and it saves walking the field twice.
    */
+  // The two morph switches, forwarded to the pool. Assignment reads as a
+  // plain field at the call site and is a method call underneath, because
+  // turning interpolation on or off mid-flight is not a flag flip: see
+  // ShapePool.setInterpolate and Attractor.setInterp.
+  get morphing() { return this.pool.morphing; }
+  set morphing(on) { this.pool.setMorphing(on); }
+  get interpolate() { return this.pool.interpolate; }
+  set interpolate(on) { this.pool.setInterpolate(on); }
+  // What the panel shows: how often the drawn shape actually changes, and
+  // how often it is rebuilt. Per slot, per second, measured.
+  get shapeHz() { return this.pool.shapeHz; }
+  get rebuildHzNow() { return this.pool.rebuildHzNow; }
+
   update(dt, cam) {
     this._clock += dt;
     if (cam) this._centre = cam.worldPos();
     this.layout.update(this._centre);
     this._sync();
-    if (this.morphing) this.pool.update(dt, this._prio);
+    this.pool.update(dt, this._prio);
     // After _sync, so an object that materialised this frame is placed at the
     // current time rather than at time zero -- otherwise a cell entering the
     // generation radius would appear at its t=0 position and then jump.

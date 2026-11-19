@@ -1,6 +1,12 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- Not for the browser's benefit, which is free to ignore all three of these
+     and mostly does: the deploy script is what actually defeats the cache, by
+     stamping every module URL with the build id. See bin/deploy. -->
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>IFS splat</title>
 <style>
   :root { color-scheme: dark; --ink:#e9edf3; --dim:#7f8898; --line:#20262f;
@@ -47,10 +53,19 @@
     text-transform:uppercase; color:var(--dim); font-weight:600; }
   #look label.off { opacity:.38; cursor:not-allowed; }
   #look .key { margin-left:auto; color:var(--dim); font-size:10.5px; }
-  #look button { width:100%; margin-top:6px; padding:4px 8px; cursor:pointer;
+  #look .step { display:flex; align-items:center; gap:6px; padding:3px 0;
+    user-select:none; }
+  #look .step button { width:23px; margin-top:0; padding:0; line-height:19px;
+    font-size:13px; }
+  #look .step button:disabled { opacity:.3; cursor:not-allowed; }
+  #look .step .val { margin-left:auto; color:var(--acc);
+    font-variant-numeric:tabular-nums; }
+  #look .step.off { opacity:.38; }
+  #look button, #look a.btn { width:100%; margin-top:6px; padding:4px 8px; cursor:pointer;
     font:inherit; font-size:11px; color:var(--ink); border-radius:7px;
     background:rgba(255,255,255,.06); border:1px solid var(--line); }
-  #look button:hover { background:rgba(255,255,255,.12); }
+  #look button:hover, #look a.btn:hover { background:rgba(255,255,255,.12); }
+  #look a.btn { display:block; text-align:center; text-decoration:none; }
   #err { position:fixed; inset:0; display:none; place-items:center; padding:28px;
     text-align:center; color:#ff9f9f; white-space:pre-wrap; }
 </style>
@@ -72,8 +87,11 @@
     <tr id="rSc"><td class="k">zoom</td><td id="sc">—</td></tr>
     <tr id="rHere"><td class="k">inside</td><td id="here">—</td></tr>
     <tr id="rFld"><td class="k">in view</td><td id="fld">—</td></tr>
-    <tr id="rMor"><td class="k">morph</td><td id="mor">—</td></tr>
+    <tr id="rMor"><td class="k">morph cost</td><td id="mor">—</td></tr>
+    <tr id="rMHz"><td class="k">morph fps</td><td id="mhz">—</td></tr>
+    <tr id="rRHz"><td class="k">rebuild fps</td><td id="rhz">—</td></tr>
     <tr id="rInv"><td class="k">inversions</td><td id="inv">—</td></tr>
+    <tr><td class="k">build</td><td id="build">—</td></tr>
   </table>
 </div>
 
@@ -85,7 +103,8 @@
     <b>O</b> <span id="kO"></span> &nbsp;·&nbsp; <b>P</b> <span id="kP"></span></div>
   <div class="row" id="flyKeys"><b>drag</b> look &nbsp;·&nbsp; <b>WASD/QE</b> fly
     &nbsp;·&nbsp; <b>wheel</b> speed &nbsp;·&nbsp;
-    <b>space</b> <span id="kA"></span> &nbsp;·&nbsp; <b>R</b> restart</div>
+    <b>space</b> <span id="kA"></span> &nbsp;·&nbsp; <b>R</b> restart
+    &nbsp;·&nbsp; <b>&minus; +</b> <span id="kD"></span></div>
   <div class="row" id="note"></div>
 </div>
 
@@ -104,21 +123,77 @@
     <span class="key">P</span></label>
   <button id="optReset">restart flight <span class="key">R</span></button>
   <hr>
+  <h2>detail</h2>
+  <div class="step" id="lLod">
+    <button id="lodDown" title="less detail">&minus;</button>
+    <button id="lodUp" title="more detail">+</button>
+    <span class="val" id="lodName">&mdash;</span>
+  </div>
+  <div class="hint" id="lodHint">&nbsp;</div>
+  <label id="lDis"><input type="checkbox" id="optDis" checked> dissolve big splats</label>
+  <div class="hint" id="disHint">&nbsp;</div>
+  <hr>
   <h2>look</h2>
   <label><input type="checkbox" id="fxIrid" checked> iridescence</label>
   <label><input type="checkbox" id="fxRim" checked> rim light</label>
   <label><input type="checkbox" id="fxNeb" checked> nebula</label>
   <label><input type="checkbox" id="fxStar" checked> stars</label>
   <div class="hint" id="fxHint">&nbsp;</div>
+  <hr>
+  <h2>morph</h2>
+  <label id="lMorph"><input type="checkbox" id="optMorph" checked> morphing</label>
+  <label id="lInterp"><input type="checkbox" id="optInterp" checked> interpolate</label>
+  <div class="hint" id="morphHint">&nbsp;</div>
+  <hr>
+  <a class="btn" id="about" href="https://claude.ai/artifact/GRiwEV6yX8nvA4uiSZeEKd"
+     target="_blank" rel="noopener">how it works &#8599;</a>
+  <div class="hint">The write-up: the claims, the argument, and every
+    measurement behind them.</div>
 </div>
 
 <div id="err"></div>
 
 <script type="module">
-import { Viewer } from './js/viewer.js';
+import { Viewer, DETAIL } from './js/viewer.js';
 
 const $ = (id) => document.getElementById(id);
 const show = (el, on) => { el.style.display = on ? '' : 'none'; };
+
+// Which copy of the demo is this?
+//
+// `dev` in the repo; `bin/deploy` rewrites this one line with the time it
+// published, and stamps the same id onto every module URL it copies. So the
+// panel and the console both name the build, and the only way to see an old
+// id is to be looking at an old page -- which is the question this answers.
+const BUILD = 'dev';
+
+// Printed before anything else runs, and outside the try: a build that fails
+// to start is exactly when knowing which build it is matters most.
+$('build').textContent = BUILD;
+console.log(`ifs-splat build ${BUILD} — ${location.href}`);
+
+// ...and is this the newest one? The page cannot tell on its own: a browser
+// that served it from cache served the stamp along with it, so the stamp
+// agrees with itself whatever happened. Asking the server for this same page
+// with the cache bypassed and comparing the two stamps is the only way the
+// page can answer it. One request of a few kilobytes at startup, and the
+// difference between "I don't think I got the newest version" and knowing.
+fetch(location.href, { cache: 'no-store' })
+  .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
+  .then((t) => {
+    const m = t.match(/const BUILD = '([^']*)'/);
+    if (!m || m[1] === BUILD) return;
+    // A marker rather than the other id: the panel column is one line wide,
+    // and the console has room to say which is which.
+    const cell = $('build');
+    cell.textContent = `${BUILD} *`;
+    cell.style.color = '#e8b24a';
+    cell.title = `the server has ${m[1]}`;
+    console.warn(`ifs-splat: this page is build ${BUILD}, the server has ${m[1]}`
+               + ' — it came from a cache. Reload bypassing it (shift-reload, or'
+               + ' devtools with "disable cache" ticked).');
+  })
+  .catch(() => {});      // offline, or opened from a file: nothing to compare
 
 try {
   const v = new Viewer($('gl'));
@@ -168,6 +243,27 @@ try {
   });
   $('optReset').addEventListener('click', () => { v.resetFlight(); v.onstate(); });
 
+  // Detail.  Same discipline as the checkboxes: the button moves the viewer's
+  // own state and then asks it to re-publish, so the keys and the buttons
+  // cannot drift apart.
+  $('lodDown').addEventListener('click', () => { v.setDetail(v.detail - 1); v.onstate(); });
+  $('lodUp').addEventListener('click', () => { v.setDetail(v.detail + 1); v.onstate(); });
+  $('optDis').addEventListener('change', () => { v.setDissolve($('optDis').checked); v.onstate(); });
+
+  // The morph switches. `interpolate` is the one worth having in a panel:
+  // with it on, the shape between two rebuilds is a lerp done as the
+  // traversal reads the table, so the drawn shape moves every frame; with it
+  // off, it steps at the rebuild rate, and the two figures in the HUD say by
+  // how much. Neither switch changes the picture at the moment it is
+  // flipped -- tests/toggles.mjs checks exactly that -- so what you see is
+  // the difference in MOTION, which is the thing being demonstrated.
+  $('optMorph').addEventListener('change', () => {
+    v.morphing = $('optMorph').checked; v.onstate();
+  });
+  $('optInterp').addEventListener('change', () => {
+    v.interpolate = $('optInterp').checked; v.onstate();
+  });
+
   // Which controls apply depends on the scene: the proof panel and the
   // ordered/exact comparison are object-scene things, and the autopilot and
   // restart only mean anything in flight.  Disabled rather than hidden, so
@@ -184,11 +280,39 @@ try {
       $(lab).className = on ? '' : 'off';
       $(box).disabled = !on;
     };
+    $('optMorph').checked = !!v.morphing;
+    $('optInterp').checked = !!v.interpolate;
     gate('lAuto', 'optAuto', fly);
+    // Both are field-scene machinery: the single object has its own slower
+    // morph and no interpolation, so offering the switches there would be
+    // offering two boxes that do nothing.
+    gate('lMorph', 'optMorph', fly);
+    gate('lInterp', 'optInterp', fly && v.canInterpolate && !!v.morphing);
     gate('lOrd', 'optOrd', !fly);
     gate('lProof', 'optProof', !fly);
     $('optReset').disabled = !fly;
     $('optReset').style.opacity = fly ? '' : '.38';
+    // The ladder is the adaptive walk's budget, and the single object does not
+    // run the adaptive walk -- it is one fixed expansion. Gated off there
+    // rather than hidden, like everything else that does not apply.
+    const d = DETAIL[v.detail];
+    $('lodName').textContent = d.name;
+    $('lLod').className = fly ? 'step' : 'step off';
+    $('lodDown').disabled = !fly || v.detail === 0;
+    $('lodUp').disabled = !fly || v.detail === DETAIL.length - 1;
+    $('lodHint').textContent = fly
+      ? `up to ${d.ms.toFixed(1)} ms a frame and ${(d.splats / 1000) | 0}k splats, `
+        + `whichever runs out first — watch both in the panel on the left.`
+      : 'the single object is one fixed expansion, not an LOD';
+    $('optDis').checked = !!v.dissolve;
+    gate('lDis', 'optDis', fly);
+    $('disHint').textContent = v.dissolve
+      ? 'a splat too big to be honest fades out and its children carry the '
+        + 'picture — off, and the one in front of you washes the frame'
+      : 'every splat drawn at whatever size it comes out — watch a close one '
+        + 'flatten the frame';
+    $('kD').textContent = `detail: ${d.name}`;
+    $('kD').className = fly ? 'on' : '';
   };
 
   v.onstate = () => {
@@ -221,6 +345,8 @@ try {
     show($('rHere'), fly);
     show($('rFld'), fly);
     show($('rMor'), fly);
+    show($('rMHz'), fly);
+    show($('rRHz'), fly);
     show($('rInv'), !fly && v.proof);
     $('note').textContent = p
       ? 'left: every splat depth-sorted. right: ordered expansion — no sort, '
@@ -242,6 +368,18 @@ try {
     $('dep').textContent = v.stats.depth;
     $('here').textContent = v.stats.here || '—';
     $('mor').textContent = v.stats.morph ? ms(v.stats.morph) : 'held';
+    const sHz = v.stats.shapeHz, rHz = v.stats.rebuildHz;
+    $('mhz').textContent = v.morphing ? sHz.toFixed(0) : 'held';
+    $('rhz').textContent = v.morphing ? rHz.toFixed(1) : 'held';
+    // The hint is the comparison the two rows are there to make, in words:
+    // what the shape does per second against what the budget rebuilds per
+    // second. Rounded to whole frames because the half-second window under
+    // it is not worth a decimal.
+    $('morphHint').textContent = !v.morphing
+      ? 'shapes held — the field still moves, the shapes do not'
+      : v.interpolate
+        ? `the drawn shape moves ${sHz.toFixed(0)}×/s from ${rHz.toFixed(1)} rebuilds/s`
+        : `the drawn shape steps at the rebuild rate, ${rHz.toFixed(1)}×/s`;
     $('fld').textContent = v.stats.resident == null ? '—'
       : `${v.stats.visible} of ${v.stats.resident}`;
     $('inv').textContent = v.stats.inversion == null ? '—'

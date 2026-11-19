@@ -92,6 +92,28 @@ export class Orbit {
 
 // ------------------------------------------------------------------ viewer
 
+/**
+ * The detail ladder, coarsest first.
+ *
+ * What a complexity dial has to drive here is the BUDGET, not the threshold.
+ * The LOD holds a time budget: AdaptiveStream.end() nudges `lodScale` every
+ * frame so the expansion costs `targetMs`, which is what lets one page give a
+ * phone and a desktop each as much detail as it can afford. Set the threshold
+ * directly and the controller has undone it by the next frame; raise the
+ * budget and the controller spends it.
+ *
+ * Doubling steps, because the threshold is a length on screen and the splat
+ * count goes about as its square -- a finer ladder would be rungs nobody can
+ * tell apart.
+ */
+export const DETAIL = [
+  { name: 'lowest',  ms: 1.5,  splats: 24000 },
+  { name: 'low',     ms: 3.0,  splats: 48000 },
+  { name: 'normal',  ms: 6.0,  splats: 96000 },
+  { name: 'high',    ms: 12.0, splats: 192000 },
+  { name: 'highest', ms: 24.0, splats: 340000 },
+];
+
 export class Viewer {
   constructor(canvas, opts = {}) {
     this.canvas = canvas;
@@ -177,9 +199,29 @@ export class Viewer {
     this.dilate = true;
     this.autopilot = true;
     this.stats = { order: 0, exact: 0, expand: 0, morph: 0, frame: 0, fps: 0,
-                   splats: 0, depth: 0, scale: 1, here: '', inversion: null };
+                   splats: 0, depth: 0, scale: 1, here: '', inversion: null,
+                   // How often the drawn shape changes, and how often it is
+                   // rebuilt: the same slot-frames tests/breath.mjs counts,
+                   // measured live. With interpolation on the first should
+                   // sit on the frame rate and the second far below it --
+                   // which is the claim the panel is now making in public.
+                   shapeHz: 0, rebuildHz: 0 };
     this._frames = 0; this._t0 = performance.now(); this._last = this._t0;
     this.keys = new Set();
+
+    // Which rung the ladder starts on: whichever one the configured budget
+    // asks for, so opts.targetMs stays the single default and this does not
+    // become a second one.
+    // The near-side lump fade (AdaptiveStream.rodFade). On by default; the
+    // switch is here because the only way to judge it is to fly into
+    // something and watch the fog go.
+    this.dissolve = this.opts.dissolve ?? true;
+
+    this.detail = 0;
+    for (let i = 1; i < DETAIL.length; i++) {
+      if (Math.abs(DETAIL[i].ms - this.opts.targetMs)
+          < Math.abs(DETAIL[this.detail].ms - this.opts.targetMs)) this.detail = i;
+    }
 
     this.buildObject(this.opts.depth);
     this.buildFlight();
@@ -344,7 +386,8 @@ export class Viewer {
       ? new FieldWorld({ ...wopts, ...(this.opts.fieldOpts || {}) })
       : new World(ringLayout(SET_NAMES, this.opts.ring), wopts);
     this.stream = new AdaptiveStream(this.world.get(this.world.first()).att, this.opts.maxSplats);
-    this.stream.targetMs = this.opts.targetMs;
+    this.setDetail(this.detail);
+    this.stream.rodFade = this.dissolve;
     this.resetFlight();
 
     const N = this.stream.max;
@@ -387,6 +430,18 @@ export class Viewer {
     gl.bindVertexArray(null);
   }
 
+  // The two morph switches the panel drives. Accessors rather than fields,
+  // for the same reason the keyboard flags are: there is one piece of state
+  // and it lives in the thing that does the work, so a box and a reload and
+  // a test all read the same answer. The field world forwards both to its
+  // pool; the ring world (opts.field false) has no pool and no
+  // interpolation, which is what `canInterpolate` is for.
+  get morphing() { return !this.world || this.world.morphing !== false; }
+  set morphing(on) { if (this.world) this.world.morphing = !!on; }
+  get canInterpolate() { return !!(this.world && this.world.pool); }
+  get interpolate() { return this.canInterpolate && this.world.interpolate !== false; }
+  set interpolate(on) { if (this.canInterpolate) this.world.interpolate = !!on; }
+
   resetFlight() {
     const W = this.world;
     const id = W.first();
@@ -416,6 +471,38 @@ export class Viewer {
     if (this.stream) this.stream.lodScale = 4.0;
   }
 
+
+  /** Fade a node's own lump out as it grows too big to be honest, leaving
+   *  the finer lumps of its children -- which the walk already draws -- to
+   *  carry the picture. */
+  setDissolve(on) {
+    this.dissolve = !!on;
+    if (this.stream) this.stream.rodFade = this.dissolve;
+    return this.dissolve;
+  }
+
+  /**
+   * Move the detail ladder.  Clamped at both ends, and it does NOT reset
+   * `lodScale`: the controller is already holding a threshold that worked,
+   * and letting it walk to the new budget from there is what keeps the change
+   * inside the cross-fade band instead of flipping a frame's worth of nodes
+   * at once.  It converges in a few frames, which is the same path a cold
+   * start takes.
+   */
+  setDetail(i) {
+    this.detail = Math.max(0, Math.min(DETAIL.length - 1, i | 0));
+    const d = DETAIL[this.detail];
+    if (this.stream) {
+      // Both, and the stream honours whichever binds first -- so a rung
+      // always costs fewer splats as well as less time, which is the half a
+      // clock alone could not promise. The top rung stays under maxSplats so
+      // the ceiling is this dial and not the buffer running out.
+      this.stream.budgetBy = 'both';
+      this.stream.targetMs = d.ms;
+      this.stream.target = Math.min(d.splats, Math.round(this.opts.maxSplats * 0.85));
+    }
+    return this.detail;
+  }
 
   // ------------------------------------------------------------ interaction
 
@@ -468,6 +555,10 @@ export class Viewer {
       else if (k === 'm') this.dilate = !this.dilate;
       else if (k === ' ') this.autopilot = !this.autopilot;
       else if (k === 'r') this.resetFlight();
+      // Detail, on the keys that every other viewer puts it on. '=' as well as
+      // '+', because '+' is a shifted key and nobody holds shift for it.
+      else if (k === '-' || k === '_') this.setDetail(this.detail - 1);
+      else if (k === '=' || k === '+') this.setDetail(this.detail + 1);
       else if ('wasdqe'.includes(k)) { this.keys.add(k); this.autopilot = false; return; }
       else return;
       e.preventDefault();
@@ -666,6 +757,8 @@ export class Viewer {
     this.stats.scale = cam.scale;
     this.stats.here = this.world.get(cam.home).name;
     this.stats.morph = this.world.reparamMs;
+    this.stats.shapeHz = this.world.shapeHz ?? 0;
+    this.stats.rebuildHz = this.world.rebuildHzNow ?? 0;
     this.stats.resident = this.world.length;
     this.stats.visible = this.world.visible;
     this.stats.phase = this.pilot.phase;

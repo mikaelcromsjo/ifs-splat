@@ -276,5 +276,58 @@ console.log('\n5. the shape on screen moves every frame, not every rebuild');
   ok(nf === 0, 'and nothing is non-finite', `${nf} non-finite slot-frames`);
 }
 
+// ------------------------------------------------- 6. resizing the jitter table
+//
+// The pool sizes each slot's jitter table by how important the slot is on
+// screen, which is the dial that makes a 60 Hz morph affordable. A node picks
+// its rotation with `hash & tableMask`, so the mask and the table it indexes
+// have to move together: grow the mask and the traversal reads entries above
+// the ones the last build wrote, which hold whatever that slot's table held
+// the last time it was that big -- another build, seconds of morph ago.
+//
+// Only a rebuild can write the table, and rebuilds are budgeted, so the
+// request and the fill are not the same frame whenever the budget is spent.
+// Hence: a slot's drawn mask may change only on a frame it was rebuilt. The
+// priority has to MOVE for any of this to happen at all -- with every slot
+// equally important nothing is ever resized and the check is vacuous, so the
+// count of resizes is asserted too.
+console.log('\n6. a table resize reaches the screen with the build that fills it');
+{
+  // A budget of 0.1 ms is one rebuild a frame -- the first of a frame always
+  // goes ahead -- which is 7.5 a second per slot across eight, so the morph
+  // is barely slowed and the resize is made to wait its turn almost every
+  // time. At the full budget the fault shows in 11 to 47 of 150 resizes
+  // depending on how busy the machine is, since the budget is spent in real
+  // milliseconds; this makes the test's sensitivity its own rather than the
+  // machine's.
+  const pool = new ShapePool({ slots: 8, seed: 7, rebuildHz: 7, rebuildBudgetMs: 0.1 });
+  const prio = new Float64Array(pool.slots);
+  const bits = pool.shapes.map((sh) => sh.att.tableBits);
+  let resizes = 0, early = 0, grew = 0;
+  for (let i = 0; i < 3600; i++) {
+    // objects coming towards the camera and going away again
+    for (let k = 0; k < pool.slots; k++)
+      prio[k] = 0.5 + 0.5 * Math.sin(0.02 * i + k * 1.7);
+    pool.update(1 / 60, prio);
+    for (let k = 0; k < pool.slots; k++) {
+      const sh = pool.shapes[k], b = sh.att.tableBits;
+      if (b === bits[k]) continue;
+      resizes++;
+      if (b > bits[k]) grew++;
+      // `lastBuilt` is -1 from the moment the resize is asked for until the
+      // rebuild that serves it, so this is "drawn at the new mask with the
+      // old table".
+      if (sh.lastBuilt === -1) early++;
+      bits[k] = b;
+    }
+  }
+  console.log(`  ${resizes} resizes over 60 s of promotions and demotions,`
+            + ` ${grew} of them growths`);
+  ok(resizes > 20, 'the dial is actually being turned', `${resizes} resizes`);
+  ok(grew > 0, 'and in the direction that can read unwritten entries', `${grew} growths`);
+  ok(early === 0, 'no frame is drawn at a mask its table was not built for',
+     `${early} slot-frames`);
+}
+
 console.log(bad ? '\nthe breath is NOT sound' : '\nthe breath is sound');
 process.exit(bad);

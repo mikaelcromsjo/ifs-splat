@@ -8,6 +8,14 @@
 import { deflateSync } from 'node:zlib';
 
 export const KAPPA = 0.35, LOWPASS = 0.3, CUT = 3.0;
+// The shader's near band, in world units: below ZN a splat is dropped, above
+// ZF it is drawn in full, in between it fades.  A centre crossing the eye is
+// a ramp, not a pop -- shaders.js carries the argument.
+export const ZN = 0.02, ZF = 0.12;
+const smoothstep = (a, b, x) => {
+  const t = Math.min(Math.max((x - a) / (b - a), 0), 1);
+  return t * t * (3 - 2 * t);
+};
 
 const nrm3 = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1;
   return [v[0] / l, v[1] / l, v[2] / l]; };
@@ -157,7 +165,8 @@ export function render({ pos, cov, rgba, off = 0, count, eye, B, W, H, fovy = 55
     const vx = R3[0] * dx + R3[1] * dy + R3[2] * dz;
     const vy = U3[0] * dx + U3[1] * dy + U3[2] * dz;
     const vz = F3[0] * dx + F3[1] * dy + F3[2] * dz;
-    if (!(vz >= 0.02)) continue;
+    if (!(vz >= ZN)) continue;
+    const nearFade = smoothstep(ZN, ZF, vz);
 
     const c = cov, o6 = 6 * id;
     const p2 = dilate ? (KAPPA * vz / F) ** 2 : 0;
@@ -192,7 +201,12 @@ export function render({ pos, cov, rgba, off = 0, count, eye, B, W, H, fovy = 55
     if (Math.abs(b) < 1e-9) ax1 = a >= d ? [1, 0] : [0, 1];
     else { const nn = Math.hypot(b, l1 - a); ax1 = [b / nn, (l1 - a) / nn]; }
     const ax2 = [ax1[1], -ax1[0]];
-    const m1 = Math.min(CUT * Math.sqrt(l1), 4096), m2 = Math.min(CUT * Math.sqrt(l2), 4096);
+    // Uncapped, as the shader's quad and py/splat_raster.py's radius both are:
+    // the box below is clipped to the screen anyway, and a cap on the extent
+    // cuts the kernel rather than the work.  (The 4096 that used to be here
+    // never bit at test resolutions, which is half of why the shader's own
+    // 2048 cap went unmeasured for so long.)
+    const m1 = CUT * Math.sqrt(l1), m2 = CUT * Math.sqrt(l2);
 
     const cx = F * vx * zi + W / 2, cy = H / 2 - F * vy * zi;
     const rx = Math.abs(m1 * ax1[0]) + Math.abs(m2 * ax2[0]);
@@ -202,7 +216,7 @@ export function render({ pos, cov, rgba, off = 0, count, eye, B, W, H, fovy = 55
     const y0 = Math.max(0, Math.floor(cy - ry)), y1 = Math.min(H - 1, Math.ceil(cy + ry));
 
     const fog = 1 - Math.min(Math.max((vz - fogNear) / Math.max(fogFar - fogNear, 1e-6), 0), 1);
-    const al = (rgba[4 * id + 3] / 255) * comp * fog;
+    const al = (rgba[4 * id + 3] / 255) * comp * fog * nearFade;
     if (al < 0.0039) continue;
     let cr = rgba[4 * id] / 255, cg = rgba[4 * id + 1] / 255, cb = rgba[4 * id + 2] / 255;
 

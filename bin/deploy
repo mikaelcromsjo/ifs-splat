@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Publish dist/ to https://mikaelcromsjo.com/splat/ -- stamped, so a stale
+# copy cannot hide.
+#
+# There is no build step: the site is index.html plus ES modules, copied. That
+# is also why caching bites. nginx sends no Cache-Control for this directory,
+# only Last-Modified and ETag, so a browser is free to apply heuristic
+# freshness (commonly a tenth of the file's age) and serve the copy it has --
+# and a module already in the module map is not revalidated on a soft reload
+# at all. The result is a page that is part new and part old, which is worse
+# than either.
+#
+# So every module URL is stamped with the build id as it is copied: the id
+# changes, the URL changes, and the browser has no cached entry for it. The
+# id is also written into the page, printed to the console and shown on the
+# panel as `build`, which is how you tell from the page which copy you have.
+#
+# The stamp lives only in the published copy. dist/ and web/ stay identical
+# and unstamped, so `diff -rq web/js dist/js` keeps meaning what it meant;
+# this script verifies what it published against its own staging copy.
+set -euo pipefail
+
+SRC=${SRC:-/srv/sandbox/ifs-splat/dist}
+DST=${DST:-/srv/sites/mikaelcromsjo/splat}
+URL=${URL:-https://mikaelcromsjo.com/splat}
+
+[ -f "$SRC/index.html" ] || { echo "no bundle at $SRC" >&2; exit 1; }
+[ -d "$DST/js" ] || { echo "no site at $DST" >&2; exit 1; }
+
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/js"
+cp "$SRC/index.html" "$STAGE/index.html"
+cp "$SRC"/js/*.js "$STAGE/js/"
+
+# The id: when it was published, and what was published. The time is what
+# changes every deploy; the content hash is what says whether anything
+# actually changed, which is the question asked after a deploy that looks
+# like it did nothing.
+WHEN=$(date -u +%Y%m%d-%H%M)
+HASH=$(cat "$STAGE/index.html" "$STAGE"/js/*.js | sha256sum | cut -c1-6)
+ID="$WHEN-$HASH"
+
+# Stamp. The import specifiers are plain relative paths in single quotes, one
+# per line even where an import statement spans several, so this reaches all
+# of them -- including index.html's entry point. A bare specifier such as
+# 'node:zlib' has no ./ and is left alone.
+sed -i "s@const BUILD = 'dev';@const BUILD = '$ID';@" "$STAGE/index.html"
+grep -q "const BUILD = '$ID';" "$STAGE/index.html" \
+  || { echo "index.html has no BUILD line to stamp" >&2; exit 1; }
+sed -i -E "s@'(\./(js/)?[A-Za-z0-9_]+)\.js'@'\1.js?v=$ID'@g" \
+  "$STAGE/index.html" "$STAGE"/js/*.js
+
+# Does it even parse?
+#
+# The checks below verify that what the server returns is what was published.
+# They cannot tell whether what was published RUNS -- and a published module
+# with a syntax error takes the whole page down, silently, because index.html
+# imports it. (That is not hypothetical: a backtick inside the GLSL template
+# literal in shaders.js shipped a build that could not load.) The modules are
+# ES modules, so they are checked as .mjs, away from the staging tree.
+CHK=$(mktemp -d)
+trap 'rm -rf "$STAGE" "$CHK"' EXIT
+for f in "$STAGE"/js/*.js; do
+  cp "$f" "$CHK/m.mjs"
+  node --check "$CHK/m.mjs" 2>&1 | sed "s@$CHK/m.mjs@${f##*/}@" \
+    || { echo "  FAIL  ${f##*/} does not parse -- nothing published" >&2; exit 1; }
+done
+echo "  ok    all $(ls "$STAGE"/js/*.js | wc -l) modules parse"
+
+# Modules first, then the page: the page names ?v=<new id> URLs, so those
+# files have to be in place before anything can ask for them. Copied, not
+# moved, and over the top of what is there -- tree.ply and .gitignore in that
+# directory are not ours and are left where they are.
+cp "$STAGE"/js/*.js "$DST/js/"
+cp "$STAGE/index.html" "$DST/index.html"
+
+# Verify what the SERVER returns, not what the disk holds: wrong content type,
+# a cached edge copy or a half-finished write are all invisible to a local
+# diff.
+fail=0
+check() { if [ "$2" = "$3" ]; then printf '  ok    %s\n' "$1"; else
+  printf '  FAIL  %s: %s, wanted %s\n' "$1" "$2" "$3"; fail=1; fi; }
+
+for f in index.html $(cd "$STAGE/js" && ls *.js | sed 's@^@js/@'); do
+  u="$URL/$f"
+  [ "$f" = index.html ] || u="$u?v=$ID"
+  code=$(curl -fsS -o "$STAGE/got" -w '%{http_code}' "$u" || echo 000)
+  if [ "$code" != 200 ]; then printf '  FAIL  %s: HTTP %s\n' "$f" "$code"; fail=1; continue; fi
+  if cmp -s "$STAGE/got" "$STAGE/${f#js/}" 2>/dev/null \
+     || cmp -s "$STAGE/got" "$STAGE/$f"; then printf '  ok    %s\n' "$f"
+  else printf '  FAIL  %s: served bytes differ from what was published\n' "$f"; fail=1; fi
+done
+ct=$(curl -fsS -o /dev/null -w '%{content_type}' "$URL/js/viewer.js?v=$ID")
+check "content type" "$ct" "application/javascript"
+grep -q "const BUILD = '$ID';" <(curl -fsS "$URL/") \
+  && echo "  ok    the page names build $ID" \
+  || { echo "  FAIL  the served page does not name build $ID"; fail=1; }
+
+echo
+if [ "$fail" = 0 ]; then
+  echo "published build $ID to $URL/"
+  echo "the panel's 'build' row and the console line should both read $ID"
+else
+  echo "published build $ID WITH FAILURES above" >&2
+  exit 1
+fi

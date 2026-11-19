@@ -150,6 +150,9 @@ export class Attractor {
     this.maxTableBits = opts.maxJitterTableBits ?? (opts.jitterTableBits ?? 10);
     this.minTableBits = opts.minJitterTableBits ?? 6;
     this.tableBits = opts.jitterTableBits ?? 10;
+    // The size a resize has ASKED for, applied by the next rebuild; equal to
+    // the drawn size whenever nothing is pending. See setTableBits().
+    this._wantBits = this.tableBits;
     const K = 1 << this.maxTableBits;
     this.tableMask = (1 << this.tableBits) - 1;
     // What IS tabulated is the part that does not depend on the jitter amount:
@@ -242,6 +245,50 @@ export class Attractor {
     // possible; see _btLimit(). A double for the same reason as _bt.
     this._btSafe = 0.5;
     this._btSafe = Infinity;
+    // The same, for the bound in the other direction; see _btLimit().
+    this._btSafeLo = -0.5;
+    this._btSafeLo = -Infinity;
+    // How many rebuilds a table resize is spread over.
+    //
+    // A node picks its rotation with `hash & tableMask`, so changing the mask
+    // re-draws the jitter of every node whose index moves -- half of them for
+    // one bit, nearly all of them for four. That is a different realisation
+    // of the same set, not a different shape, and it was the largest single
+    // movement anywhere in the demo: measured as splat positions,
+    // tests/drift.mjs finds the median step on a resize frame at 9.8e-3 of
+    // the object's radius against 5.0e-4 for an ordinary frame, and the worst
+    // at 4.3e-2 -- 86x one frame's own motion, on whichever object had just
+    // become the most important one on screen. Every one of the fourteen
+    // largest steps in a 1500-frame flight was a resize.
+    //
+    // It is invisible to everything that measures the morph, because it is
+    // not the morph: the drawn table and an exact build at the same
+    // parameter re-draw the same way, so the error stays at 1e-5 while the
+    // picture snaps. Only the STEP sees it, which is why nothing caught it.
+    //
+    // So the resize ramps instead of switching. _premulBlend() carries each
+    // moving entry from the rotation the nodes were reading to the one they
+    // will read, over this many rebuilds -- about a second at the rate the
+    // budget affords -- and the blend pair smooths each of those steps across
+    // the frames between them, exactly as it does for the morph itself. 1
+    // restores the old behaviour, in one rebuild.
+    this.migrateRebuilds = opts.migrateRebuilds ?? 4;
+    // Entries [_migLo, K) are the ones moving; below _migLo nothing changes.
+    // _migLo is the SMALLER of the two sizes either way round, so a growing
+    // table blends its new entries up from their old partners and a
+    // shrinking one blends its doomed entries down onto theirs.
+    this._migLo = 0;
+    // The weight the drawn table was built at: 0 at the far end, 1 settled.
+    // A double from the first store, for the reason _bt is; see above.
+    this._migW = 0.5;
+    this._migW = 1;
+    this._migStep = 0.5;
+    this._migStep = 1;
+    this._migGrow = true;
+    this._migBits = this.tableBits;   // a shrink's target, applied at the end
+    this._migDrop = false;            // one settled rebuild before the mask moves
+    // Scratch for the blended rotation, so _premulBlend allocates nothing.
+    this._jmix = new Float64Array(9);
     // Opt-in per attractor: a rebuild swaps which array is the newest build,
     // so `childMaps` moves under anything holding a reference to it, and an
     // object that is not morphing has nothing to interpolate anyway.
@@ -265,6 +312,103 @@ export class Attractor {
   }
 
   /**
+   * Assemble the jitter rotations for entries [k0, k1) at amount `amt`.
+   *
+   * Rodrigues, from the cached axis. Written out rather than calling
+   * jitterRotInto so the axis is not redrawn; the expressions are character
+   * for character the ones in ifs_core.js, because the two must agree -- the
+   * reference expansion uses that one, and a test asserts this table equals
+   * it exactly.
+   *
+   * A range rather than the whole table, because a table that GROWS needs
+   * only its new entries filled; see reparam().
+   */
+  _assembleJit(k0, k1, amt) {
+    const AX = this._axis, J = this._jit;
+    for (let k = k0; k < k1; k++) {
+      const r = 9 * k;
+      if (amt <= 0) {
+        J[r] = J[r + 4] = J[r + 8] = 1;
+        J[r + 1] = J[r + 2] = J[r + 3] = J[r + 5] = J[r + 6] = J[r + 7] = 0;
+      } else {
+        const ax = AX[4 * k], ay = AX[4 * k + 1], az = AX[4 * k + 2];
+        const ang = amt * AX[4 * k + 3];
+        const sn = Math.sin(ang), c = 1.0 - Math.cos(ang);
+        J[r] = 1 + c * (ax * ax - 1);
+        J[r + 1] = -sn * az + c * ax * ay;
+        J[r + 2] = sn * ay + c * ax * az;
+        J[r + 3] = sn * az + c * ay * ax;
+        J[r + 4] = 1 + c * (ay * ay - 1);
+        J[r + 5] = -sn * ax + c * ay * az;
+        J[r + 6] = -sn * ay + c * az * ax;
+        J[r + 7] = sn * ax + c * az * ay;
+        J[r + 8] = 1 + c * (az * az - 1);
+      }
+    }
+    return this;
+  }
+
+  /**
+   * Premultiply `maps` by the assembled rotations of entries [k0, k1) into
+   * `dest`: the child's effective linear part, R(address) @ A_i, which is
+   * what the traversal indexes instead of multiplying.
+   */
+  _premul(k0, k1, maps, dest) {
+    const J = this._jit, m = this.m;
+    for (let k = k0; k < k1; k++) {
+      const r = 9 * k;
+      for (let i = 0; i < m; i++) {
+        const A = maps[i].A, o = 9 * (k * m + i);
+        for (let p = 0; p < 3; p++) {
+          const j0 = J[r + p * 3], j1 = J[r + p * 3 + 1], j2 = J[r + p * 3 + 2];
+          dest[o + p * 3] = j0 * A[0] + j1 * A[3] + j2 * A[6];
+          dest[o + p * 3 + 1] = j0 * A[1] + j1 * A[4] + j2 * A[7];
+          dest[o + p * 3 + 2] = j0 * A[2] + j1 * A[5] + j2 * A[8];
+        }
+      }
+    }
+    return this;
+  }
+
+  /**
+   * The same, for entries whose rotation is on its way from one table size
+   * to another: the premultiply of a rotation blended between entry `k` and
+   * its partner `k & srcMask`, at weight `w` on entry `k` itself.
+   *
+   * The blend is of the two ROTATION MATRICES, nine lerps, and not of their
+   * axes and angles -- which would need a trig call per entry per rebuild,
+   * and has a worse failure mode: two axes that happen to be nearly opposite
+   * pass through a vector of no length, and a normalised nothing points
+   * anywhere. Lerping the matrices has no such case. What it costs is that
+   * the halfway matrix is not exactly a rotation: these are wobbles of a
+   * tenth of a radian, so its determinant dips by about 1e-3 at w = 0.5 --
+   * a 0.03% breath in the size of a splat, three orders under the 1.2e-3 of
+   * its own radius that the splat moves in a frame anyway.
+   *
+   * At w = 0 this writes exactly what `_premul` would write for the partner
+   * entry, and at w = 1 exactly what it would write for `k`. Both ends are
+   * therefore bit-identical to a table that was never resized at all, which
+   * is what makes the ramp start and finish without a step.
+   */
+  _premulBlend(k0, k1, srcMask, w, maps, dest) {
+    const J = this._jit, m = this.m, B = this._jmix, v = 1 - w;
+    for (let k = k0; k < k1; k++) {
+      const r = 9 * k, q = 9 * (k & srcMask);
+      for (let p = 0; p < 9; p++) B[p] = J[q + p] * v + J[r + p] * w;
+      for (let i = 0; i < m; i++) {
+        const A = maps[i].A, o = 9 * (k * m + i);
+        for (let p = 0; p < 3; p++) {
+          const j0 = B[p * 3], j1 = B[p * 3 + 1], j2 = B[p * 3 + 2];
+          dest[o + p * 3] = j0 * A[0] + j1 * A[3] + j2 * A[6];
+          dest[o + p * 3 + 1] = j0 * A[1] + j1 * A[4] + j2 * A[7];
+          dest[o + p * 3 + 2] = j0 * A[2] + j1 * A[5] + j2 * A[8];
+        }
+      }
+    }
+    return this;
+  }
+
+  /**
    * Point this attractor at a different set of maps.
    *
    * Stage 3 morphs one attractor into another by interpolating map
@@ -276,6 +420,93 @@ export class Attractor {
    * and tests/morph.mjs measures it.
    */
   reparam(opts = {}) {
+    // A requested resize takes effect HERE, with the build that fills the
+    // table, rather than when it was asked for -- see setTableBits().
+    //
+    // And it keeps the blend's pair, which it used to throw away. Giving up
+    // the pair stops a slot moving for a whole rebuild interval -- the two
+    // tables are identical, so every fraction draws the same shape -- and the
+    // pool resizes 150 times a minute. Measured as splat positions against an
+    // exact build at the same parameter: inside 40 frames of a resize the
+    // error ran to 9.4e-3 of the object's radius at p99 against 6.0e-5 for a
+    // settled pair, 150x worse, and it is the object that has just become the
+    // most important one on screen.
+    //
+    // Keeping it needs no stashed state, because of WHEN this runs. At the
+    // top of reparam the newest build still sits in `_cmB`, and `this.maps`
+    // and `this.jitter` are still the parameters it was built from -- the new
+    // ones arrive from `opts` further down. So:
+    //
+    //   shrinking   nothing to do. Both tables hold (their own maps) x
+    //               (rotation k) for every k, and the active entries are a
+    //               subset, so entry k still pairs with entry k.
+    //   growing     the entries above the old size were last written for some
+    //               older build. Fill them for the build in `_cmB`, from the
+    //               maps and rotations it used, and the pair is exact over
+    //               the whole new table.
+    //
+    // A node's rotation index is `hash & mask`, so a resize changes which
+    // rotation each node draws. Doing that in one frame is the largest
+    // movement in the demo -- 86x one frame's own motion at its worst, see
+    // `migrateRebuilds` -- so a resize starts a RAMP here instead, and only
+    // one at a time: a size asked for while one is running waits in
+    // `_wantBits` until it finishes, which is what it was already for.
+    if (this._wantBits !== this.tableBits && this._migW >= 1 && !this._migDrop) {
+      const oldK = this.tableMask + 1, newK = 1 << this._wantBits;
+      if (!this._everBuilt) {
+        // Never built: there is nothing on screen to be continuous with, and
+        // the first-build path below fills both tables anyway.
+        this.tableBits = this._wantBits;
+        this.tableMask = newK - 1;
+        this._jitAmt = NaN;
+      } else if (this.migrateRebuilds <= 1) {
+        // The ramp turned off: the size changes in one rebuild, which is what
+        // this did before `migrateRebuilds` existed. Kept because a reference
+        // build has to be able to be exactly the table of its own size --
+        // tests/drift.mjs and tests/secant.mjs both compare the drawn table
+        // against one -- and because it is the A/B that says what the ramp is
+        // worth.
+        this.tableBits = this._wantBits;
+        this.tableMask = newK - 1;
+        if (newK > oldK) {
+          this._assembleJit(oldK, newK, this._jitAmt);
+          this._premul(oldK, newK, this.maps, this._cmB);
+        }
+      } else {
+        // The moving entries are the ones above the SMALLER of the two
+        // sizes, whichever direction this is: a grow blends its new entries
+        // up from the partners whose rotation their nodes have been reading,
+        // and a shrink blends its doomed entries down onto those same
+        // partners. `_migLo` is a power of two, so `_migLo - 1` is the mask
+        // that names the partner.
+        this._migLo = newK < oldK ? newK : oldK;
+        this._migGrow = newK > oldK;
+        this._migBits = this._wantBits;
+        this._migStep = 1 / (this.migrateRebuilds > 1 ? this.migrateRebuilds : 1);
+        this._migW = 0;
+        this._migDrop = false;
+        if (this._migGrow) {
+          // A grow takes the new mask at once, because at w = 0 the new
+          // entries are exact copies of the entries the nodes were already
+          // reading: the mask moves and nothing on screen does.
+          this.tableBits = this._wantBits;
+          this.tableMask = newK - 1;
+          // `_jit` is assembled at `_jitAmt`, the amount the build in `_cmB`
+          // used; extend it over the new entries at that same amount and
+          // `_jitAmt` stays true, so the premultiply below will not redo the
+          // whole table unless the jitter itself has moved.
+          this._assembleJit(oldK, newK, this._jitAmt);
+          // Close the pair over the new entries, at w = 0, with the maps the
+          // build in `_cmB` was made from -- it is about to become `_cmA` by
+          // the swap below, and the older half of the pair has to cover the
+          // whole new table or the blend reads a build seconds of morph old.
+          this._premulBlend(oldK, newK, this._migLo - 1, 0, this.maps, this._cmB);
+        }
+        // A shrink keeps its size while it merges, and gives the mask up at
+        // the end of this function, when both halves of the pair hold the
+        // doomed entries as exact copies of their partners.
+      }
+    }
     // The newest build becomes the previous one: a pointer swap, nothing
     // copied.
     //
@@ -362,72 +593,52 @@ export class Attractor {
     // effective linear part is R(its address) @ A_i, and both factors are
     // known here, so the traversal never multiplies them: it indexes them.
     // That is the difference between ~350 and ~210 multiplies per node.
-    const K = this.tableMask + 1, CM = this._cmB, AX = this._axis, J = this._jit;
-    const amt = this.jitter;
-    if (amt !== this._jitAmt) {
-      // Rodrigues, assembled from the cached axis.  Written out rather than
-      // calling jitterRotInto so the axis is not redrawn; the expressions are
-      // character for character the ones in ifs_core.js, because the two must
-      // agree -- the reference expansion uses that one, and a test asserts
-      // this table equals it exactly.
-      for (let k = 0; k < K; k++) {
-        const r = 9 * k;
-        if (amt <= 0) {
-          J[r] = J[r + 4] = J[r + 8] = 1;
-          J[r + 1] = J[r + 2] = J[r + 3] = J[r + 5] = J[r + 6] = J[r + 7] = 0;
-        } else {
-          const ax = AX[4 * k], ay = AX[4 * k + 1], az = AX[4 * k + 2];
-          const ang = amt * AX[4 * k + 3];
-          const sn = Math.sin(ang), c = 1.0 - Math.cos(ang);
-          J[r] = 1 + c * (ax * ax - 1);
-          J[r + 1] = -sn * az + c * ax * ay;
-          J[r + 2] = sn * ay + c * ax * az;
-          J[r + 3] = sn * az + c * ay * ax;
-          J[r + 4] = 1 + c * (ay * ay - 1);
-          J[r + 5] = -sn * ax + c * ay * az;
-          J[r + 6] = -sn * ay + c * az * ax;
-          J[r + 7] = sn * ax + c * az * ay;
-          J[r + 8] = 1 + c * (az * az - 1);
-        }
+    const K = this.tableMask + 1, amt = this.jitter;
+    if (amt !== this._jitAmt) { this._assembleJit(0, K, amt); this._jitAmt = amt; }
+    if (this._migW >= 1 && !this._migDrop) {
+      this._premul(0, K, this.maps, this._cmB);
+    } else {
+      // One step of a resize ramp. `_migW` is the weight the table being
+      // built here is at, so it advances BEFORE the build rather than after:
+      // when this returns, `_migW` describes what is on screen, which is what
+      // a test comparing the two can rely on.
+      if (this._migW < 1) {
+        this._migW += this._migStep;
+        if (this._migW > 1) this._migW = 1;
       }
-      this._jitAmt = amt;
-    }
-    for (let k = 0; k < K; k++) {
-      const r = 9 * k;
-      for (let i = 0; i < this.m; i++) {
-        const A = this.maps[i].A, o = 9 * (k * this.m + i);
-        for (let p = 0; p < 3; p++) {
-          const j0 = J[r + p * 3], j1 = J[r + p * 3 + 1], j2 = J[r + p * 3 + 2];
-          CM[o + p * 3] = j0 * A[0] + j1 * A[3] + j2 * A[6];
-          CM[o + p * 3 + 1] = j0 * A[1] + j1 * A[4] + j2 * A[7];
-          CM[o + p * 3 + 2] = j0 * A[2] + j1 * A[5] + j2 * A[8];
+      const w = this._migGrow ? this._migW : 1 - this._migW;
+      this._premul(0, this._migLo, this.maps, this._cmB);
+      this._premulBlend(this._migLo, K, this._migLo - 1, w, this.maps, this._cmB);
+      if (!this._migGrow && this._migW >= 1) {
+        // The merge has finished: these entries now hold exactly what their
+        // partners hold. One more rebuild at the same weight puts the OTHER
+        // half of the pair there too -- and only then is dropping the mask
+        // free, because the drawn shape is a blend of both halves and a node
+        // whose index folds down onto its partner has to find the same
+        // rotation in each. Dropping it one rebuild earlier moves the picture
+        // by one ramp step, which is the whole thing this is avoiding.
+        if (this._migDrop) {
+          this.tableBits = this._migBits;
+          this.tableMask = (1 << this._migBits) - 1;
+          this._migDrop = false;
+        } else {
+          this._migDrop = true;
         }
       }
     }
     for (let i = 0; i < this.m; i++)
       for (let k = 0; k < 3; k++) this.mapB[3 * i + k] = this.maps[i].b[k];
     this.sArr = Float64Array.from(this.s);
-    // The first build has no previous state to come from, so it is its own
-    // previous state -- otherwise frame one would interpolate out of an
-    // uninitialised table, which is a field of zero matrices and looks like
-    // every object imploding.
-    // The blend's starting point is what is CURRENTLY ON SCREEN, not the
-    // previous build.
-    //
-    // Swapping the two tables instead is cheaper and wrong: a rebuild can
-    // land while the blend is only part way across, and swapping throws that
-    // partial state away, so the shape snaps back to the previous build
-    // before setting off again. That leaves the worst single-frame jump
-    // exactly as large as it was without interpolating -- all the cost and
-    // none of the smoothness. Copying the displayed table makes every
-    // rebuild continuous by construction: blend(0) is, bit for bit, the
-    // frame that was just drawn.
+    // Close the pair the blend reads, and bound how far it may be trusted.
+    // WHICH two builds it reads was settled at the top of this function --
+    // two genuine consecutive builds, not the drawn shape and this one; see
+    // there for why the cheaper-looking choice turns the slope into noise.
     if (this.interp) {
       this._gather(this._sB);
-      this._btSafe = this._btLimit();
       if (this._everBuilt) {
-        // The owner sets the fraction from its parameter clock, in the same
-        // update, after this returns.
+        this._btSafe = this._btLimit();
+        // The fraction itself comes from the owner's parameter clock, in the
+        // same update, after this returns.
       } else {
         // The first build has no previous state to come from, so it is its
         // own previous state -- otherwise frame one would interpolate out of
@@ -438,6 +649,13 @@ export class Attractor {
         for (let i = 0; i < n; i++) A[i] = B[i];
         this._sA.set(this._sB);
         this._bt = 1;
+        this._btSafeLo = -Infinity;
+        // And the bound belongs to the pair it was computed from. `_btLimit`
+        // reads `_sA` against `_sB`, so taking it before this collapse
+        // bounds the blend by a pair that is being thrown away -- a pair
+        // whose two halves are now identical, which cannot run any quantity
+        // down to zero at any fraction whatsoever.
+        this._btSafe = Infinity;
       }
     }
     this._everBuilt = true;
@@ -449,22 +667,50 @@ export class Attractor {
    *
    * A node picks its rotation with `hash & tableMask`, so changing the mask
    * changes WHICH rotation each node gets -- the shape stays the same family
-   * and the same size, but its branch jitter is a different draw. That is a
-   * visible shimmer if it happens on something large, and invisible on
-   * something small, which is exactly when it is allowed to happen. The pool
-   * only ever shrinks a slot that has become unimportant and only grows one
-   * on a rebuild, so the change rides along with work that was happening
-   * anyway.
+   * and the same size, but its branch jitter is a different draw. The claim
+   * here used to be that this is a visible shimmer on something large and
+   * invisible on something small, which is when it is allowed to happen.
+   * The second half was wrong: the pool re-cuts tables by RANK, and rank
+   * changes hands between the two objects that matter most on screen as
+   * readily as between two specks. Measured as splat positions, a resize was
+   * the largest movement in the demo -- 20x an ordinary frame's motion at the
+   * median and 86x at the worst, on whichever object had just become the most
+   * important one. So reparam() now ramps it over `migrateRebuilds` rebuilds
+   * instead of switching it, and this is still where the request lands.
+   *
+   * So this does not resize anything: it records the size wanted, and the
+   * next rebuild starts applying it. The mask and the table it indexes have
+   * to change together, and only a rebuild can change the table -- while the
+   * request is outstanding the slot keeps drawing the table it has, which is
+   * consistent with the mask it has. A request that arrives while a ramp is
+   * running waits here until that ramp finishes.
+   *
+   * Moving the mask at the moment of the request is not: a GROW makes the
+   * traversal index entries above the ones the last build wrote, and those
+   * hold whatever the slot's table held the last time it was that big --
+   * another build of it, seconds of morph ago. The pool asks for the resize
+   * in its ranking pass and the rebuild that would fill it is budgeted, so
+   * the two are not the same frame whenever the budget is spent: measured
+   * over 60 s of promotions and demotions, 11 to 47 of 150 resizes were drawn
+   * for one or two frames before their rebuild landed -- a shimmer on
+   * whichever object had just become the most important one on screen. The
+   * spread is the budget, which is spent in real milliseconds, so how often
+   * this happened depended on how busy the machine was.
+   * (A SHRINK was always safe, the active entries being a subset of what the
+   * last build wrote, and it costs nothing to make both wait.)
+   *
+   * The saving is unaffected: it was never in the mask, it is in the rebuild
+   * premultiplying K entries instead of 1024, and that happens when the bits
+   * land.
    */
   setTableBits(b) {
     const want = b < this.minTableBits ? this.minTableBits
                : b > this.maxTableBits ? this.maxTableBits : b;
-    if (want === this.tableBits) return false;
-    this.tableBits = want;
-    this.tableMask = (1 << want) - 1;
-    this._jitAmt = NaN;        // the rotations must be laid out again
-    this._everBuilt = false;   // and there is no comparable previous table
-    return true;
+    if (want === this._wantBits) return false;
+    this._wantBits = want;
+    // Asking for the size already on screen cancels a pending resize, and
+    // needs no rebuild of its own.
+    return want !== this.tableBits;
   }
 
   setPalette(pal) {
@@ -564,12 +810,19 @@ export class Attractor {
    */
   _btLimit() {
     const A = this._sA, B = this._sB, m = this.m;
-    let lim = Infinity;
+    let lim = Infinity, lo = -Infinity;
+    // Both ways along the line, because the blend now runs both ways. Past
+    // the newer build a SHRINKING quantity is the one that reaches zero;
+    // before the older one it is a GROWING one, at the mirror of the same
+    // formula. The bound is kept to 90% of the nearer crossing in each
+    // direction -- for the negative bound that is 0.9x a negative number,
+    // which moves it towards zero, the safe way.
     const bound = (i) => {
       const a = A[i], b = B[i];
-      if (!(b < a)) return;                  // not shrinking: cannot reach zero
+      if (b === a) return;                   // flat: cannot reach zero either way
       const t0 = a / (a - b);                // where the line crosses zero
-      if (t0 > 0 && t0 < lim) lim = t0;
+      if (b < a) { if (t0 > 0 && t0 < lim) lim = t0; }
+      else if (t0 < 0 && t0 > lo) lo = t0;
     };
     for (let j = 0; j < 3; j++) { bound(9 + j); bound(30 + j); }   // sig0, rodSig
     bound(18); bound(22); bound(26);                              // diag Q
@@ -578,6 +831,7 @@ export class Attractor {
     for (let j = 0; j < m; j++) bound(sb + j);                    // child scales
     const tail = 42 + 4 * m;
     bound(tail); bound(tail + 1); bound(tail + 2);                // R, qMax, rodMax
+    this._btSafeLo = lo === -Infinity ? -Infinity : lo * 0.9;
     return lim === Infinity ? Infinity : lim * 0.9;
   }
 
@@ -596,11 +850,90 @@ export class Attractor {
    *
    * Costs about sixty lerps. The table is not touched: see the constructor.
    */
-  setBlend(t, tMax = 2.5) {
+  setBlend(t, tMax = 2.5, tMin = -1.5) {
     if (!this.interp) return this;
     const top = tMax < this._btSafe ? tMax : this._btSafe;
-    this._bt = t < 0 ? 0 : t > top ? top : t;
+    // Negative is allowed, and has to be.
+    //
+    // The owner builds about one rebuild interval ahead so that the pair
+    // brackets the present (see field.js). That makes the hand-over from one
+    // secant to the next land at the sample they share -- exactly continuous
+    // -- and the fraction is 0 there. So the floor sits right where every
+    // rebuild lands, and a gap that comes in shorter than the estimate asks
+    // for a fraction slightly below it. Flooring at 0 froze the shape for
+    // those frames and then released it: measured, 22 slot-frames of 10,552
+    // stepped more than 8x the true motion, every one of them at exactly
+    // 0.00. Carrying the line a little way back the other side of its older
+    // sample is the same second-order read as carrying it past the newer one,
+    // and it is continuous.
+    const bot = tMin > this._btSafeLo ? tMin : this._btSafeLo;
+    this._bt = t < bot ? bot : t > top ? top : t;
     this._scatter(this._bt);
+    return this;
+  }
+
+  /**
+   * Turn read-time interpolation on or off on a LIVE attractor, which is a
+   * different thing from setting `interp` and has to be, in both directions.
+   *
+   * Off is not just "stop lerping". The drawn shape may be anywhere between
+   * the two builds, or past the newer one -- the blend extrapolates -- and
+   * the small state (moments, radius, map offsets) was scattered to match.
+   * Leaving that in place and clearing the flag would freeze the shape at a
+   * fraction of a rebuild that is about to be overwritten, and leave the
+   * moments describing a shape the table no longer draws. So both go to the
+   * newest build.
+   *
+   * On is the one with teeth. While interpolation is off, reparam() stops
+   * swapping the tables, so `_cmA` is whatever build happened to be current
+   * when it was switched off -- one rebuild ago, or ten thousand, which is a
+   * completely different shape. Starting to lerp from that would walk the
+   * drawn shape back through a stale morph, and extrapolating from it can
+   * push variances negative (the reason `_btLimit` exists). Making the pair
+   * degenerate first means the blend is a no-op until the next rebuild gives
+   * it a real pair, and from there it is ordinary two-build interpolation.
+   *
+   * Both directions end in the same few lines, and the fold is the one that
+   * makes this a switch rather than a jolt: the blend is
+   * FOLDED into the newest build before the pair is collapsed. Collapsing
+   * without folding sets the drawn shape to `_cmB`, and `_cmB` is not what
+   * is on screen -- the blend extrapolates, so the shape sits typically a
+   * third of a rebuild interval PAST it. The picture would snap backwards at
+   * the click, which was measured (8 of 8 slots moved) before the fold was
+   * added. Folding costs one pass over the table, once, on a UI action.
+   */
+  setInterp(on) {
+    // `_sB` is a snapshot taken under this very flag -- reparam() gathers it
+    // only while interpolating -- so while interpolation is OFF every rebuild
+    // moves the live moments, radius, child scales and translations and
+    // leaves the snapshot behind. Collapsing the pair onto a stale `_sB` and
+    // scattering it is then a silent clobber of the shape itself: measured
+    // across an off-then-on click with ten seconds of morphing in between,
+    // all 8 slots jumped, R by up to 1.37 and sigma0 by 8x, while the drawn
+    // table stayed the newest build. So the geometry, its level of detail and
+    // the camera's idea of where its children are all described a build that
+    // had left the screen seconds before, until that slot's next rebuild
+    // re-gathered -- and with morphing off, for good.
+    //
+    // Re-gathering here makes `_scatter(1)` below reassert what is actually
+    // on screen. It is also what keeps a never-interpolated attractor from
+    // scattering a table of ZEROS: `_sB` starts zeroed, and an attractor
+    // built with `interp: false` has never had it filled.
+    if (!this.interp) this._gather(this._sB);
+    const t = this._bt;
+    if (t !== 1) {
+      const A = this._cmA, B = this._cmB;
+      for (let i = 0; i < B.length; i++) B[i] = A[i] + (B[i] - A[i]) * t;
+      const a = this._sA, b = this._sB;
+      for (let i = 0; i < b.length; i++) b[i] = a[i] + (b[i] - a[i]) * t;
+    }
+    this._cmA.set(this._cmB);
+    this._sA.set(this._sB);
+    this._bt = 1;
+    this._btSafe = Infinity;
+    this._btSafeLo = -Infinity;
+    this._scatter(1);
+    this.interp = !!on;
     return this;
   }
 }
@@ -1058,6 +1391,26 @@ export class AdaptiveStream {
     // nothing ever flips discontinuously in the first place.
     this.lo = 0.9;
     this.hi = 3.2;
+    // The near side of the same idea, for the node's OWN lump.
+    //
+    // `lo`/`hi` above decide when a subtree is too small to be worth
+    // expanding. Nothing decided when a lump was too BIG to be worth drawing,
+    // so every visited node painted its own Gaussian at any size, including
+    // one that filled the screen -- and a screen-filling Gaussian is a smooth
+    // wash with no structure in it, laid over the finer lumps of its own
+    // children, which the walk is already drawing underneath.
+    //
+    // So: fade the lump out as its projected size grows, and what is left is
+    // the cloud of its children. That is not invented detail, it is the same
+    // attractor one level down, jittered per node by hash -- which is why it
+    // can only move `tests/fidelity.mjs` the right way.
+    //
+    // In fractions of the viewport height, not pixels, so a phone and a
+    // desktop fade at the same apparent size. Full below rodFadeLo, gone
+    // above rodFadeHi.
+    this.rodFade = true;
+    this.rodFadeLo = 0.10;
+    this.rodFadeHi = 0.40;
     this.lodScale = 4.0;                      // feedback, to hold the budget
     // A TIME budget, not a splat budget.  How many nodes a machine can expand
     // per frame varies by an order of magnitude between a phone and a desktop,
@@ -1192,9 +1545,18 @@ export class AdaptiveStream {
     this.offset = this.head;
     this.lastMs = now() - this._t0;
     if (this.budgetBy !== 'frozen') {
-      const err = this.budgetBy === 'time'
-        ? this.lastMs / this.targetMs
-        : c / Math.max(this.target, 1);
+      // 'both' is what a user-facing quality dial needs. A time budget alone
+      // says nothing about how many splats come out of it -- a walk that
+      // emits cheap splats fast can spend 6 ms and hand the GPU a quarter of
+      // a million of them -- so turning the dial down shortened the walk
+      // without reliably shortening the draw. Taking the worse of the two
+      // errors lets whichever budget binds first drive the threshold: the
+      // clock on a slow machine, the splat count on a fast one.
+      const errT = this.lastMs / this.targetMs;
+      const errN = c / Math.max(this.target, 1);
+      const err = this.budgetBy === 'time' ? errT
+                : this.budgetBy === 'splats' ? errN
+                : Math.max(errT, errN);
       // The threshold is a controller, and like any causal controller it is
       // caught out when the view changes faster than it can track: climb out
       // of an attractor facing away, see almost nothing, let the threshold
@@ -1278,6 +1640,18 @@ export class AdaptiveStream {
     const kRod = (rx - cam.pos[0]) * cam.f[0] + (ry - cam.pos[1]) * cam.f[1] +
                  (rz - cam.pos[2]) * cam.f[2];
 
+    // How big is this node's own lump about to be drawn?  Same quantity the
+    // occlusion test uses below: its 1-sigma radius on screen.  A lump whose
+    // centre has gone behind the eye lands at znear and so fades out whole,
+    // which is the case the near band in the shader can only soften.
+    let rodF = 1;
+    if (this.rodFade) {
+      const rs = view.focal * kap * att.rodMax / Math.max(kRod, view.znear);
+      const lo = this.rodFadeLo * view.H, hi = this.rodFadeHi * view.H;
+      rodF = (hi - rs) / (hi - lo);
+      rodF = rodF < 0 ? 0 : rodF > 1 ? 1 : rodF;
+    }
+
     // ---- the m children, and where their mass is
     const CA = this._CA, CB = this._CB, CC = this._CC;
     const ca = 36 * sp, cb = 12 * sp;
@@ -1344,8 +1718,10 @@ export class AdaptiveStream {
     for (let k = 0; k < 5; k++) {
       const it = ord[ko + k];
       if (it === 0) {
-        this.curHash = h;
-        this.emitRod(AB, a0, rx, ry, rz, level, ft, kap);
+        if (rodF > 0) {
+          this.curHash = h;
+          this.emitRod(AB, a0, rx, ry, rz, level, ft * rodF, kap);
+        }
       } else {
         const i = it - 1, o = ca + 9 * i, d = cb + 3 * i;
         for (let q = 0; q < 9; q++) chA[ha + q] = CA[o + q];

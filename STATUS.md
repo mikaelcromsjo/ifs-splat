@@ -451,6 +451,112 @@ The fraction itself sits at a median of 1.33, p90 1.73, p99 2.01, and is held at
 0.29% of slot-frames — so the shape is a third of a rebuild ahead of the last build most of the
 time, and essentially never pinned.
 
+#### Both of these are switches in the panel now, with the rate beside them
+
+The claim in the table above is the kind that is easy to make and hard to show, so the demo makes
+it on screen: a *morph* section with **morphing** and **interpolate**, and two HUD rows that count
+what they do. `morph fps` is how often the drawn shape actually changes; `rebuild fps` is how
+often it is rebuilt. Unticking **interpolate** collapses the first onto the second, live.
+
+The rate is counted, not inferred: a slot-frame counts as moved if that slot was rebuilt or its
+blend fraction changed, which is the same event `tests/breath.mjs` counts offline, accumulated
+over a half-second window. At the demo's own settings `tests/toggles.mjs` measures 57.7 drawn
+changes a second from 2.7 rebuilds a second with interpolation on, and 7.0 from 7.0 with it off.
+
+Writing the switches turned up two faults in the switching itself, neither visible from the flag:
+
+- **Switching interpolation off snapped the picture backwards.** The blend extrapolates, so the
+  drawn shape normally sits a third of a rebuild *past* the newest build; collapsing the pair to
+  that build moved 8 slots of 8. `Attractor.setInterp` now folds the live blend into the newest
+  build before collapsing, so the switch changes the motion without changing the frame it is
+  clicked on. That is asserted directly: snapshot the drawn table either side of every flip, zero
+  slots may differ.
+- **The meters carried half a second of the old behaviour across the switch** -- which is exactly
+  the half second someone who just clicked is reading. Both switches reset them.
+
+Turning interpolation back on has a third hazard that was designed out rather than found: while it
+is off, `reparam()` stops swapping the tables, so the older one holds whatever build was current
+when it was switched off. Lerping from that would walk the shape back through a morph it already
+did, and extrapolating from it is exactly the negative-variance case above. The pair is collapsed
+on the way in, so the blend is a no-op until the next rebuild gives it two real builds again.
+
+And a fourth that was not designed out, found by flying with the switch: the small derived state
+-- the moments, the bounding radius, the child scales, the LOD metric, the map translations -- is
+snapshotted under that same flag, by `reparam` itself. So while interpolation is off it stops
+being taken, and the collapse above then scattered a snapshot that was a build old over a table
+that was current. The drawn table was exactly right and everything that reads the shape *around*
+it was a build behind: all 8 slots jumped at the click, `R` by as much as 1.37 and sigma0 by 8x,
+which is the hard kind of wrong -- the geometry drawn at another build's level of detail, with its
+children offset from where the camera thinks they are. Nothing put it right until that slot's next
+rebuild re-gathered, and with the morph held, nothing ever did. `setInterp` re-gathers the live
+state when it is the one turning interpolation on, and `tests/toggles.mjs` now snapshots the
+moments, radius, scales and translations across every flip as well as the table.
+
+#### The parameter was right and the picture still jumped
+
+Everything above measures the morph as a parameter or as a table entry, and a viewer sees neither.
+A splat's position is the premultiplied table composed down an address, times the interpolated
+moment centre, plus the interpolated translations -- three blends in a product, and a product of
+blends is not the blend of a product. `tests/drift.mjs` walks fixed addresses the way `visit()`
+does, through the drawn tables at the drawn fraction and through an exact build at the same morph
+parameter, and differences the two points. It was red:
+
+- **17 slot-frames of 10,552 stepped more than 8x as far as the true splat moved**, up to 36x, and
+  every one of them was a rebuild frame with the fraction at exactly 1.00.
+- 7 moved *against* the morph; the worst position error was 9.6e-3 of the object's radius.
+
+Three separate causes, none of them visible in the quantity it was written in terms of:
+
+1. **The build was made at the parameter the morph had already reached.** That makes the newest
+   sample the present, so the blend can only extrapolate -- and it puts the hand-over from one
+   secant to the next at the far tip of the old one, where two lines disagree most. The fraction
+   resets to `(u - uA)/(u - uA)` = 1 exactly, so whatever had been extrapolated is discarded in
+   one frame. Building one schedule *quantum ahead* puts the pair either side of the present: the
+   fraction runs 0 -> 1 between rebuilds and the hand-over lands on the sample both lines share,
+   where they agree exactly. The drawn parameter does not move -- the secant is still read at `u`
+   -- so nothing lags; only the spacing of the samples changes.
+2. **A table resize threw the blend's pair away.** Two identical tables draw the same shape at
+   every fraction, so the slot stopped moving for a whole rebuild interval, 150 times a minute, on
+   whichever object had just become the most important one on screen: 9.4e-3 at p99 within 40
+   frames of a resize against 6.0e-5 for a settled pair. It needs no stashed state to keep --
+   at the top of `reparam` the newest build is still in `_cmB` and the parameters it was built
+   from are still in `this.maps`, so a shrink needs nothing at all and a grow needs only its new
+   entries filled.
+3. **The resize also forced a rebuild immediately**, a quarter of a quantum after the last one,
+   while the older sample still sat a whole quantum ahead of the present -- a fraction of -3.06.
+   Clamping that is a freeze, and releasing it is a step. The resize now rides along with the
+   slot's next ordinary rebuild, which is what `setTableBits` always claimed it did.
+
+Two smaller things fell out of it. The lead must come from the schedule's **quantum**, which is
+exact, and not from the smoothed measured gap: an average of an irregular series is larger than
+the gap about half the time and each of those asks for a negative fraction, which is how 9 and
+then 5 slot-frames came to sit exactly on the floor. And the floor itself had to become symmetric
+with the ceiling (-1.5 against +2.5), because reading a secant a little before its older sample
+is the same second-order read as reading it past the newer one.
+
+With all three fixed: **0 jumps, 0 reversals**, worst position error 8.2e-5 of the radius against
+1.0e-2 for not interpolating at all, and the drawn motion equals the true motion to 1.000x at p50,
+p90 and p99. Reverting any one of the three turns `drift.mjs` red again.
+
+#### The read is a secant, and that is not a shortcut
+
+The morph is splined once, between map sets, and read linearly from there: the two most recent
+builds are two samples of that spline, and the drawn shape is the line through them evaluated at
+the parameter the morph has reached. `tests/secant.mjs` differences that read against an exact
+build at the same parameter, entry by entry over the premultiplied table. Over 12,960 slot-frames
+the error is 1.6e-4 at p50 and 8.9e-4 at p99, where drawing the newest build alone is 4.9e-3 and
+the drawn table's own frame-to-frame step is 1.1e-3 -- so the straight line misses the curve by
+about a seventh of the movement it is drawing, and by 0.15% of an entry at p99.
+
+Which is the answer to the obvious next idea. A spline at the read level needs a third sample,
+and a third sample is a third resident table (288 KB a slot) and a third set of reads in the hot
+loop -- the budget that materialising the blend into one table blew, for a residual already an
+order of magnitude under one frame of motion. And the fraction never falls below 1: this is an
+extrapolation every frame, never an interpolation, so the error is largest exactly where a cubic
+is worst -- 2.7e-5 at fractions under 1.25 against 5.1e-4 past 2.0. That tail belongs to the
+2.7% of slot-frames whose rebuild the budget deferred, so it is bought back by the schedule, not
+by the curve.
+
 One line of this is load-bearing and looks like a typo: `_bt` is initialised to 0.5 and then to 1.
 V8 takes a field's representation from the first value stored, so initialising it to the integer 1
 means the first real fraction changes the representation, transitions the hidden class and throws
@@ -460,6 +566,100 @@ away the optimised `reparam` — 15 ms a rebuild instead of 2.4, for six rebuild
 `tests/breath.mjs` has a fifth section now, measuring the table as the traversal reads it rather
 than the parameters that feed it: the pool can be morphing perfectly and still be showing a frozen
 shape, which is the whole fault.
+
+#### A sixth, on the dial that makes all of it affordable
+
+Reading the drawn table rather than the parameters turned up a second thing wrong with it, nothing
+to do with the blend. The pool sizes each slot's jitter table by how important the slot is on
+screen -- the object filling the view gets 1024 rotations, the specks get 64, and that is what
+makes a 60 Hz morph affordable at all. The resize is asked for in the ranking pass; the rebuild
+that would fill the table is budgeted. They are not the same frame whenever the budget is spent.
+
+A node picks its rotation with `hash & tableMask`, so moving the mask alone moves which entries
+the traversal reads. Shrinking is harmless -- the active entries are a subset of what the last
+build wrote. Growing is not: the entries above what the last build wrote hold whatever that slot's
+table held the last time it was that big, which is another build of it, seconds of morph ago. And
+it happens on the object that has just become the most important one on screen, which is the one
+being looked at. Measured over 60 s of promotions and demotions: of 150 resizes, 11 to 47 were
+drawn for one or two frames before their rebuild landed, the spread being how busy the machine was
+-- the budget is spent in real milliseconds.
+
+`setTableBits` now records the size wanted and the next rebuild applies it, so the mask and the
+table it indexes always belong to the same build. The saving is untouched: it was never in the
+mask, it is in that rebuild premultiplying K entries instead of 1024. `tests/breath.mjs` §6 flies
+60 s of changing importance at a budget that defers nearly every resize, and asserts that no slot
+is ever drawn at a mask its table was not built for -- 47 slot-frames before, 0 now.
+
+#### And the dial itself was the jump
+
+Flown with all of the above in place, the picture was still jumpy at times. It was not the blend.
+
+`tests/drift.mjs` prints the drawn step beside the true one, and the step column had an outlier
+nobody had read: **4.28e-2 of the object's radius at its worst against 2.61e-3 at p99** — 86x one
+frame's own motion. Every one of the fourteen largest steps in a 1500-frame flight was a frame on
+which a slot's jitter table changed *size*, and the median step on a resize frame was **9.75e-3
+against 5.0e-4** for an ordinary one. The pool re-cuts 140 to 150 tables a minute.
+
+A node picks its rotation with `hash & tableMask`, so a resize re-draws the branch jitter of every
+node whose index moves — half of them for one bit, nearly all of them for four. It is a different
+*realisation* of the same set, not a different shape, and there is no clever indexing that avoids
+it: if the extra entries mean anything at all, the shape with 1024 of them is not the shape with
+64. What can be fixed is that it happened in one frame.
+
+**Why nothing caught it, which is the more useful half.** Both tests that measure the drawn table
+compare it against an exact build *at the same mask* — so the reference re-draws its jitter in the
+same frame and in the same way, and the error sat at 1.5e-5 while the picture snapped. The only
+column that could see it was the step, and the step was asserted as a *ratio* against the true
+motion, which was equally large: the ratio read 1.00 and the check passed. `drift.mjs` has an
+absolute bound now, against the distribution of ordinary frames, and it is red at 86x if the ramp
+below is switched off.
+
+**The fix is to ramp the resize instead of switching it** (`Attractor.migrateRebuilds`, 4):
+
+- A **grow** takes its new mask at once, with every new entry holding an exact copy of the entry
+  its nodes were already reading — the mask moves and nothing on screen does — and then carries
+  each moving entry to its own rotation over four rebuilds.
+- A **shrink** keeps its size and merges the doomed entries onto their partners over the same four
+  rebuilds; the mask is dropped only once *both* halves of the blend's pair are at the merged
+  weight. Dropping it one rebuild earlier moves the picture by one ramp step, which is the thing
+  being avoided.
+- Each of those four steps is then smoothed across the frames between rebuilds by the read-time
+  blend, which was already there for the morph. That is why four is enough: the ramp only has to
+  break the change into steps no bigger than a rebuild's own.
+- The blend is of the two rotation **matrices**, nine lerps an entry, not of their axes and angles:
+  no trig in a per-rebuild loop, and no case where two nearly opposite axes interpolate through a
+  vector of no length. The halfway matrix is not exactly a rotation — at a tenth of a radian its
+  determinant dips about 1e-3, a 0.03% breath in the size of a splat, three orders under the
+  1.2e-3 of its own radius that the splat moves in a frame anyway.
+
+| worst drawn step in a 1500-frame flight | switched | ramped |
+|---|---|---|
+| in units of the object's radius | 4.28e-2 | **2.66e-3** |
+| against the p99 of an ordinary frame | 16x | **1.03x** |
+| against the median ordinary frame | 86x | **5x** |
+
+Mid-resize frames now step *less* than ordinary ones (p99 2.04e-3 against 2.59e-3, median 5.2e-4
+against 5.4e-4), because a slot's hand-over between realisations partly opposes the morph it is
+riding on. Tracking is unchanged where it is defined: 1.5e-5 at p50, 7.9e-5 at worst.
+
+**It costs nothing measurable.** A rebuild with a ramp in flight costs what a settled rebuild at
+the larger of the two sizes costs — 0.507 ms either way on this machine, against 0.236 ms at 64
+entries. What a ramp defers is the *saving* from a shrink, by four rebuilds.
+
+**What it costs the tests** is worth stating, because it is a real loss. While a ramp runs the
+drawn shape is deliberately part way between two realisations, so an exact build at the new size
+is not what it should equal: `drift.mjs` leaves those slot-frames out of its tracking checks (40%
+of them here, the ramp being four rebuilds of a seven-a-second schedule) and `secant.mjs` leaves
+them out of its entry-wise error, and both print the count. The step checks cover them instead,
+which is the honest division of the claim — a blend of two valid realisations of the same set at
+the same morph parameter *is* a valid shape, and what has to be true of it is that it arrives
+smoothly.
+
+**Rejected on measurement: hysteresis on the ranking.** Sizes come from rank, so two objects of
+nearly equal importance trading places re-cut both their tables although neither changed on
+screen, which looked like most of the churn. A two-place dead band turned 137 resizes over 60 s
+into 142 — nothing, because rank drifts steadily through all eight positions as the camera flies,
+so a dead band delays a re-cut rather than preventing it. Not shipped.
 
 ### The climb does not arc any more
 
@@ -550,11 +750,21 @@ predictions left standing rather than quietly edited.
 3. ~~**Publishing.**~~ Done 2026-11-17, on the owner's go-ahead: `dist/` is live at
    <https://mikaelcromsjo.com/splat/>, served straight from `/srv/sites/mikaelcromsjo/splat/`
    by the existing nginx vhost (no config change needed; `.js` goes out as
-   `application/javascript`, so the ES modules load). `README.txt` was deliberately left out of
+   `application/javascript`, so the ES modules load). Published with `bin/deploy` since
+   2026-11-18, which stamps the build id into the page and onto every module URL and then checks
+   what the server returns; the id is on the panel as `build` and in the console.
+   `README.txt` was deliberately left out of
    the published copy because it quotes internal `/srv/` paths. The directory also holds an
    unrelated `tree.ply` (2.6M, the 38229-splat parity export) which predates the publish and is
    publicly reachable; nothing in the demo references it.
 4. **Audio-driven map parameters** — the plan's explicit stretch goal, untouched.
+   **`tests/legible.mjs` is red, and was already.** At the documented invocation
+   (`120 280 210 1`) it reports 13.4% washed-out frames against its own 10% limit — dive 13.1%,
+   climb 20.9%, 2 blank frames of 3600. Checked against `HEAD` exported to a scratch tree and run
+   the same way: **every reported outcome identical to the frame**, so the interpolation work of
+   2026-11-18 neither caused it nor moved it. The limit is tighter than the flight has reached at
+   this seed and length; it is an outcome probe to be compared in pairs, not a gate, and the
+   legibility items above are the open work it belongs to.
 5. ~~**The live site is a build behind.**~~ Republished 2026-11-17 on the owner's go-ahead:
    <https://mikaelcromsjo.com/splat/> now serves the field build (11 modules, `field.js` among
    them, all verified 200 with `application/javascript`). It opens on the field; **F** switches
@@ -567,6 +777,10 @@ predictions left standing rather than quietly edited.
    therefore wrapped: a background that will not compile disables the nebula and leaves the flat
    clear colour, rather than taking the page down with it. The splat programs are unchanged from
    what was already live and are still fatal.
+   Republished 2026-11-18 with the three interpolation fixes above (`setInterp` re-gathers, the
+   table resize waits for its rebuild, `_btSafe` comes from its own pair) -- `adaptive.js` was the
+   only file that differed, verified byte-identical to `dist/` over HTTP at
+   `application/javascript`. Redeploying after a change no longer waits on a go-ahead.
 
 ## How to look at any of it without a browser
 
@@ -579,6 +793,9 @@ node tests/void.mjs                       # the coordinate chain
 node tests/gpu_transcribe.mjs 7           # the compute kernel vs the CPU
 node tests/field.mjs                      # the cell field: determinism, separation, budget
 node tests/breath.mjs                     # the morph: C1, breathing, inside the budget
+node tests/toggles.mjs                    # the morph switches, and the panel's two rates
+node tests/secant.mjs                     # the read-time blend vs an exact build
+node tests/drift.mjs                      # drawn splat positions vs an exact build
 node tests/jitterbits.mjs                 # the jitter table vs the reference, and its size
 node tests/mapset.mjs                     # every set, every pair, and the whole spline
 node tests/catalogue.mjs                  # all 11 sets, and a morph, as pictures

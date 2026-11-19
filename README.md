@@ -93,7 +93,10 @@ cd web && python3 -m http.server 8000      # then open http://localhost:8000/
 
 **F** switches between the endless field and the single object · **P** opens the proof panel ·
 **space** takes the autopilot off · the panel on the right toggles iridescence, rim light, nebula
-and stars. `dist/` is the same demo with the test-only modules stripped, ready to drop on any
+and stars, and switches the morph and its interpolation on and off while the HUD shows what each
+costs: *morph fps* is how often the drawn shape actually changes, *rebuild fps* how often it is
+rebuilt. Unticking **interpolate** collapses the first onto the second, which is the judder the
+interpolation exists to remove, visible side by side with its own number. `dist/` is the same demo with the test-only modules stripped, ready to drop on any
 static host.
 
 The original exporter writes a standard 3DGS `.ply` that SuperSplat, antimatter15/splat,
@@ -114,6 +117,9 @@ cd web
 node tests/tour.mjs 150 out/tour.png   # fly the whole demo for 150 s, as a filmstrip
 node tests/legible.mjs 120 280 210 1   # is there anything to SEE, or is it a fog bank?
 node tests/breath.mjs                  # the morph: C¹, breathing, at display rate, in budget
+node tests/toggles.mjs                 # the morph switches, and the rates the panel shows
+node tests/secant.mjs                  # what the read-time blend misses, against an exact build
+node tests/drift.mjs                   # drawn splat positions against an exact build
 node tests/field.mjs                   # the field: disjoint cells, budget, eviction, motion
 node tests/fidelity.mjs                # the level of detail against ground truth
 node tests/gpu_transcribe.mjs 7        # the compute kernel against the CPU expansion

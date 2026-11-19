@@ -10,6 +10,9 @@ const VERT_SRC = `#version 300 es
 precision highp float;
 precision highp int;
 
+// The near band, in world units: see where nearFade is built below.
+const float ZN = 0.02, ZF = 0.12;
+
 uniform vec3  uEye;
 uniform mat3  uRv;          // world -> view; rows are right, up, forward
 uniform vec2  uFocal;       // pixels per unit at z = 1
@@ -43,7 +46,41 @@ void main() {
   vColor = vec4(0.0); vConic = vec3(1.0, 0.0, 1.0); vDelta = vec2(0.0);
 //FETCH_BODY
   vec3 v = uRv * (sPos - uEye);
-  if (v.z < 0.02) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
+
+  // The near band: ZN is where a splat is dropped, ZF is where it is drawn in
+  // full, and in between it fades.
+  //
+  // This used to be a single "if (v.z < 0.02) return", which is a cull on the
+  // CENTRE -- so a rod whose body still surrounded the camera was discarded
+  // whole, in one frame, the instant its centre crossed behind the eye. The
+  // thing you had just flown into blinked out.
+  //
+  // It cannot be fixed by projecting it properly, because there is nothing to
+  // project: J is the affine approximation of the projection AT the centre,
+  // and at z <= 0 it does not exist. (Even at z = 0.5 the ellipse it gives is
+  // not the splat's real footprint, which is why the honest answer in that
+  // regime is a ray-space evaluation and a different alpha model -- a bigger
+  // change than this, and one that moves every raster baseline with it.)
+  //
+  // So what is fixed here is the DISCONTINUITY, not the projection. A splat
+  // whose centre reaches the eye still ends up invisible; it now gets there
+  // over the band instead of in one frame, so nothing pops and no edge ever
+  // appears. The band is absolute, and wide enough to be a ramp rather than a
+  // flicker: measured on the real autopilot over the field, at its own default
+  // speed (0.0062) a static splat takes 89 frames at the median step and 71 at
+  // the p99 step to cross it -- call it a second and a half, against the one
+  // frame a pop takes by definition.
+  //
+  // What it costs, measured rather than assumed: the parity and fidelity
+  // scenes never put a splat inside the band, and both are bit-identical to
+  // what they were before it existed. The flight does put splats inside it --
+  // tests/legible.mjs at 120 280 210 1, same seed, same 3600 frames, runs
+  // 28.8% washed out with the band taken out and 23.5% with it in. So the
+  // band is worth 5.3 points of fog, all of it on the dive: the climb sits at
+  // 32.9% either way, because what washes the climb is splats farther out
+  // than ZF, which no near band can reach.
+  if (v.z < ZN) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
+  float nearFade = smoothstep(ZN, ZF, v.z);
 
   mat3 S = mat3(sCovA.x, sCovA.y, sCovA.z,
                 sCovA.y, sCovB.x, sCovB.y,
@@ -66,7 +103,7 @@ void main() {
   float det0 = determinant(S2);
   S2[0][0] += uLowpass; S2[1][1] += uLowpass;
   float det1 = determinant(S2);
-  if (det1 <= 0.0) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
+  if (!(det1 > 0.0)) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
   float comp = sqrt(clamp(max(det0, 0.0) / det1, 0.0, 1.0));
 
   vConic = vec3(S2[1][1], -S2[0][1], S2[0][0]) / det1;
@@ -80,13 +117,61 @@ void main() {
            ? (S2[0][0] >= S2[1][1] ? vec2(1.0, 0.0) : vec2(0.0, 1.0))
            : normalize(vec2(S2[0][1], l1 - S2[0][0]));
   vec2 ax2 = vec2(ax1.y, -ax1.x);
-  vec2 maj = min(uCut * sqrt(l1), 2048.0) * ax1;
-  vec2 mnr = min(uCut * sqrt(l2), 2048.0) * ax2;
+  float m1 = uCut * sqrt(l1), m2 = uCut * sqrt(l2);
+  vec2 maj = m1 * ax1, mnr = m2 * ax2;
 
   vec2 centre = vec2(uFocal.x * v.x * zi + uViewport.x * 0.5,
                      uViewport.y * 0.5 - uFocal.y * v.y * zi);
-  vDelta = aCorner.x * maj + aCorner.y * mnr;
-  vec2 p = centre + vDelta;
+
+  // No cap on how far that quad may reach -- a fix, not an omission.
+  //
+  // The extent used to be min(uCut * sqrt(l1), 2048.0). The fragment shader
+  // only evaluates the kernel INSIDE this quad, so that cap cut the Gaussian
+  // dead straight as soon as a splat grew past 2048 px -- not at its 3-sigma
+  // tail where nothing is left to see, but at a fraction of a sigma, with
+  // most of its alpha still standing. A sigma-2 blob at z = 2 was cut at
+  // 1.48 sigma with 33% of peak alpha at the cut; at z = 0.5, 0.37 sigma and
+  // 93%. Four quad edges, four straight sides: fly into one large splat and
+  // it has the silhouette of a polygon. Worse, once the centre drifted off
+  // axis the capped quad stopped covering the viewport at all, so the cut
+  // walked across the middle of the view instead of staying off-screen.
+  //
+  // Big on screen is not an edge case here. A node large on screen does get
+  // expanded (sigma > hi gives t = 1, so no blob), but what it expands INTO
+  // is rods, and the rod you are flying into is one splat a few metres away:
+  // that is the large splat, every time. Blobs join it when the walk stops
+  // descending -- "level >= this.maxLevel" forces t = 0 at any size, and
+  // budget pressure raises lodScale and with it the size at which a subtree
+  // is still drawn as one blob. A splat larger than the window is a routine
+  // frame, not a mistake.
+  //
+  // Why no cap is needed at all: the quad has only to COVER the part of the
+  // kernel that is on screen. Coverage is decided per fragment from vDelta,
+  // which is affine in the vertex with w = 1, so its interpolation is exact
+  // for ANY quad containing ellipse-intersect-viewport. Past the screen
+  // diagonal the oriented quad has nothing left to save -- it exists so that
+  // elongated rods do not drag a box of dead fragments, and no box larger
+  // than the window is cheaper than the window -- so beyond that size draw
+  // the kernel's bounding box clipped to the viewport. That cannot cut
+  // anything a viewer could see, and it costs the fragments it covers, which
+  // is the honest price of being inside a splat.
+  //
+  // The reference this file transcribes (py/splat_raster.py) never had a cap:
+  // its radius is uncapped and clipped to the screen. The cap was this
+  // shader's alone, which is why no headless measurement ever showed it --
+  // cpu_raster.js bounds a screen-clipped box and so cannot reproduce it.
+  vec2 p;
+  if (m1 <= length(uViewport)) {
+    vDelta = aCorner.x * maj + aCorner.y * mnr;
+    p = centre + vDelta;
+  } else {
+    vec2 r  = abs(maj) + abs(mnr);
+    vec2 lo = max(centre - r, vec2(0.0));
+    vec2 hi = min(centre + r, uViewport);
+    if (lo.x >= hi.x || lo.y >= hi.y) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
+    p = mix(lo, hi, 0.5 + 0.5 * aCorner);
+    vDelta = p - centre;
+  }
   gl_Position = vec4(p.x / uViewport.x * 2.0 - 1.0,
                      1.0 - p.y / uViewport.y * 2.0, 0.0, 1.0);
 
@@ -126,7 +211,7 @@ void main() {
   }
 
   float fog = 1.0 - clamp((v.z - uFogNear) / max(uFogFar - uFogNear, 1e-6), 0.0, 1.0);
-  vColor = vec4(c.rgb, c.a * comp * fog);
+  vColor = vec4(c.rgb, c.a * comp * fog * nearFade);
 }
 `;
 

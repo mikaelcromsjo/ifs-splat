@@ -13,6 +13,16 @@ import { writeFileSync } from 'node:fs';
 const depth = Number(process.argv[2] ?? 6);
 const RES = Number(process.argv[3] ?? 256);
 const KAPPA = 0.35, LOWPASS = 0.3, CUT = 3.0;
+// The shader's near band.  py/splat_raster.py has no equivalent -- it culls at
+// cam.znear and does not fade -- so the two diverge for a splat whose centre is
+// within ZF of the eye.  This scene puts the camera outside the whole attractor,
+// so nothing here comes near it; if a parity scene ever flies inside, the
+// reference has to grow the band before the comparison means anything.
+const ZN = 0.02, ZF = 0.12;
+const smoothstep = (a, b, x) => {
+  const t = Math.min(Math.max((x - a) / (b - a), 0), 1);
+  return t * t * (3 - 2 * t);
+};
 
 const tree = expand(depth, 0.16, 3);
 const N = tree.N, pos = tree.pos, cov = tree.cov, rgba = tree.rgba;
@@ -51,7 +61,8 @@ for (let s = 0; s < N; s++) {
   const vx = r3[0] * dx + r3[1] * dy + r3[2] * dz;
   const vy = u3[0] * dx + u3[1] * dy + u3[2] * dz;
   const vz = f3[0] * dx + f3[1] * dy + f3[2] * dz;
-  if (vz < 0.02) continue;
+  if (vz < ZN) continue;
+  const nearFade = smoothstep(ZN, ZF, vz);
 
   const c = cov.subarray(6 * id, 6 * id + 6);
   const px = KAPPA * vz / F, p2 = px * px;
@@ -76,7 +87,7 @@ for (let s = 0; s < N; s++) {
   const det0 = a * d - b * b;
   a += LOWPASS; d += LOWPASS;
   const det1 = a * d - b * b;
-  if (det1 <= 0) continue;
+  if (!(det1 > 0)) continue;
   const comp = Math.sqrt(Math.min(Math.max(det0, 0) / det1, 1));
   const con = [d / det1, -b / det1, a / det1];
 
@@ -86,14 +97,14 @@ for (let s = 0; s < N; s++) {
   if (Math.abs(b) < 1e-9) ax1 = a >= d ? [1, 0] : [0, 1];
   else { const n = Math.hypot(b, l1 - a); ax1 = [b / n, (l1 - a) / n]; }
   const ax2 = [ax1[1], -ax1[0]];
-  const m1 = Math.min(CUT * Math.sqrt(l1), 2048), m2 = Math.min(CUT * Math.sqrt(l2), 2048);
+  const m1 = CUT * Math.sqrt(l1), m2 = CUT * Math.sqrt(l2);
 
   const cx = F * vx * zi + W / 2, cy = H / 2 - F * vy * zi;
   const rx = Math.abs(m1 * ax1[0]) + Math.abs(m2 * ax2[0]);
   const ry = Math.abs(m1 * ax1[1]) + Math.abs(m2 * ax2[1]);
   const x0 = Math.max(0, Math.floor(cx - rx)), x1 = Math.min(W - 1, Math.ceil(cx + rx));
   const y0 = Math.max(0, Math.floor(cy - ry)), y1 = Math.min(H - 1, Math.ceil(cy + ry));
-  const al = (rgba[4 * id + 3] / 255) * comp;
+  const al = (rgba[4 * id + 3] / 255) * comp * nearFade;
   const cr = rgba[4 * id] / 255, cg = rgba[4 * id + 1] / 255, cbl = rgba[4 * id + 2] / 255;
 
   for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {

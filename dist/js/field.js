@@ -532,6 +532,17 @@ export class ShapePool {
     // allows, not on time, and clamping at 1 put a third of the frames back
     // at a standstill.
     this.blendMax = opts.blendMax ?? 2.5;
+    // How far BEFORE the older of the two builds the blend may be read.
+    //
+    // Symmetric with blendMax, which allows 1.5 spans past the newer sample,
+    // and for the same reason. The pair brackets the present, so a rebuild
+    // lands at a fraction of 0 and the fraction a shorter-than-estimated gap
+    // asks for is 1 - gap/lead below it -- a gap half the estimate asks for
+    // -1. A floor of -0.5 was reached on 9 slot-frames of 10,552 and every
+    // one of them was a jump, because a floor is a freeze and the release is
+    // a step: this is a budget-driven schedule, so irregular gaps are the
+    // normal case, not the exception. See Attractor.setBlend.
+    this.blendMin = opts.blendMin ?? -1.5;
     // The jitter table is what makes both a rebuild and a blend cost what
     // they cost: everything scales with 9*m*K. tests/jitterbits.mjs says 256
     // entries (x127 reuse) still show no visible repetition, so paying for
@@ -569,6 +580,9 @@ export class ShapePool {
     // costs nothing: ranks drift slowly, so a pass almost never has more than
     // one slot wanting a different size anyway.
     this.resizePerPass = opts.resizePerPass ?? 1;
+    // Rebuilds a re-cut table is ramped over; see Attractor.migrateRebuilds.
+    // Here so that a test can turn the ramp off (1) for the whole pool.
+    this.migrateRebuilds = opts.migrateRebuilds ?? 4;
     this._rank = new Int32Array(this.slots);
     // The quantum, in rebuilds per second of travel. It is not the rate any
     // slot achieves -- the budget is -- it is the finest step the schedule
@@ -617,6 +631,7 @@ export class ShapePool {
         omega: spec.omega ?? 0.28, seed: this.seed + k, jitter: this.jitter,
         palette: palBuf,
         jitterTableBits: this.tableBits,
+        migrateRebuilds: this.migrateRebuilds,
         // Opt this attractor into read-time interpolation: it is what makes
         // a rebuild fold the displayed shape into the previous table instead
         // of discarding it.
@@ -645,6 +660,26 @@ export class ShapePool {
     this._pU = new Float64Array(this.slots);
     this._want = new Int32Array(this.slots);   // blend candidates, reused
     this._u = 0;
+
+    // The two rates the HUD shows, measured rather than assumed.
+    //
+    // "How often does the shape on screen change" is neither the frame rate
+    // nor the rebuild rate, and the difference between those two is the
+    // whole point of interpolating: a slot can be rebuilt 3 times a second
+    // and still move every frame, or move 3 times a second and judder. Only
+    // the pool can tell them apart, because only the pool knows whether a
+    // slot's drawn shape moved -- it moved if it was rebuilt, or if its
+    // blend fraction did. That is the same event tests/breath.mjs counts
+    // offline; this counts it live, for a number on the panel.
+    //
+    // Over a window rather than per frame: 1/dt at 60 Hz is noise, and a
+    // rebuild rate near 3 Hz needs a window to be a rate at all.
+    this.shapeHz = 0;          // drawn-shape changes per second, per slot
+    this.rebuildHzNow = 0;     // rebuilds per second, per slot
+    this.meterSeconds = opts.meterSeconds ?? 0.5;
+    this._accChg = 0; this._accReb = 0; this._accDt = 0;
+    this._btPrev = new Float64Array(this.slots);
+    this._builtK = new Uint8Array(this.slots);
 
     // Warm the rebuild path here, in the constructor, where a pause is already
     // expected (building the slots costs ~143 ms of jitter tables anyway).
@@ -745,6 +780,80 @@ export class ShapePool {
    * that, this class does not and must not.  Omitted means all slots equal,
    * which degrades to round-robin by overdue-ness.
    */
+  /**
+   * Count this frame's drawn-shape changes and, every `meterSeconds`, turn
+   * the counts into the two rates. Called on every path out of update(),
+   * including the one where morphing is off -- a meter that stops being
+   * updated reads as whatever it last said, which is the one number a
+   * frozen morph must not show.
+   */
+  /**
+   * Start the meters again from nothing. Called by both switches, because a
+   * rate measured across a switch is a rate for neither side of it: the
+   * window that straddles the click would report the old behaviour for up to
+   * half a second after the new one started, which is exactly the half
+   * second someone who just clicked is looking at the number.
+   */
+  _meterReset() {
+    this.shapeHz = 0; this.rebuildHzNow = 0;
+    this._accChg = 0; this._accReb = 0; this._accDt = 0;
+    for (let k = 0; k < this.slots; k++) {
+      this._btPrev[k] = this.shapes[k].att._bt;
+      this._builtK[k] = 0;
+    }
+    return this;
+  }
+
+  _meter(dt) {
+    let chg = 0;
+    for (let k = 0; k < this.slots; k++) {
+      const bt = this.shapes[k].att._bt;
+      if (this._builtK[k] || bt !== this._btPrev[k]) chg++;
+      this._btPrev[k] = bt;
+      this._builtK[k] = 0;
+    }
+    this._accChg += chg;
+    this._accDt += dt;
+    if (this._accDt >= this.meterSeconds) {
+      this.shapeHz = this._accChg / this.slots / this._accDt;
+      this.rebuildHzNow = this._accReb / this.slots / this._accDt;
+      this._accChg = 0; this._accReb = 0; this._accDt = 0;
+    }
+  }
+
+  /**
+   * Interpolation on or off, live, for every slot at once.
+   *
+   * Not a plain assignment: each attractor has to reconcile its own blend
+   * state first, and Attractor.setInterp says why. The pool's own half is
+   * the parameter pair -- `uA` is where the drawn shape was when the newest
+   * build landed, and after setInterp the drawn shape IS the newest build,
+   * so uA has to come with it. Leaving it behind would hand the next frame a
+   * fraction measured from a shape that is no longer on screen.
+   */
+  setInterpolate(on) {
+    this.interpolate = !!on;
+    for (let k = 0; k < this.slots; k++) {
+      const sh = this.shapes[k];
+      sh.att.setInterp(this.interpolate);
+      sh.uA = sh.uB;
+    }
+    this._meterReset();
+    return this;
+  }
+
+  /**
+   * Morphing on or off. Off holds every slot at the shape it is drawing now:
+   * the parameter stops advancing, nothing is rebuilt, and the blend stops
+   * being touched, so the frame is identical to the last one morph made.
+   * Nothing is thrown away -- turning it back on carries on from there.
+   */
+  setMorphing(on) {
+    this.morphing = !!on;
+    this._meterReset();
+    return this;
+  }
+
   update(dt, priority) {
     const t0 = now();
     this._clock += dt;
@@ -761,7 +870,11 @@ export class ShapePool {
     this.reparamMs = 0;
     this.rebuildsThisFrame = 0;
     this.deferred = 0;
-    if (!this.morphing || SET_NAMES.length < 2) { this.lastMs = now() - t0; return; }
+    if (!this.morphing || SET_NAMES.length < 2) {
+      this._meter(dt);
+      this.lastMs = now() - t0;
+      return;
+    }
 
     const N = SET_NAMES.length;
     const due = this._due;
@@ -793,7 +906,21 @@ export class ShapePool {
         const sh = this.shapes[rank[r]];
         const bits = this.bitsByRank[r < this.bitsByRank.length
           ? r : this.bitsByRank.length - 1];
-        if (sh.att.setTableBits(bits)) { sh.lastBuilt = -1; resized++; }
+        // Asked for, not forced. Marking the slot due here (`lastBuilt = -1`)
+        // used to be how the new size reached the screen promptly, and it is
+        // now the only thing left that makes the blend jump: it rebuilds a
+        // slot that is nowhere near due, so the two samples end up a quarter
+        // of a quantum apart while the older one still sits a whole quantum
+        // AHEAD of the present. The fraction that asks for is -3.06,
+        // measured, which the floor then clamps -- a freeze, and the release
+        // is a step of 9x to 26x the true motion.
+        //
+        // It is also unnecessary. The resize is applied by reparam() now, so
+        // it rides along with the slot's next ordinary rebuild, which is at
+        // most one quantum away and is exactly what setTableBits() says it
+        // does. The dial is about what a rebuild costs on average; waiting a
+        // few frames for one costs nothing measurable.
+        if (sh.att.setTableBits(bits)) resized++;
       }
     }
 
@@ -867,19 +994,79 @@ export class ShapePool {
 
       const sh = this.shapes[best];
       const u = this._pU[best];
+      // Build AHEAD of the morph, by about one rebuild interval.
+      //
+      // This is the difference between a blend that interpolates and one that
+      // only ever extrapolates, and it is the whole of the pop.
+      //
+      // Building at `u` -- where the morph is NOW -- makes the newest sample
+      // the present, so the blend can only ever read the line beyond its own
+      // endpoint. Worse, it puts the hand-over from one line to the next at
+      // the far tip of the old one, which is exactly where the two disagree:
+      // on the rebuild frame the fraction is (u - uA)/(u - uA) = 1 exactly,
+      // so whatever the old line had extrapolated to is discarded and the
+      // shape is set to the new build in one frame. Measured against an exact
+      // build at the same parameter, over 10,552 slot-frames of splat
+      // positions walked down fixed addresses: 17 frames stepped more than 8x
+      // as far as the true shape moved, up to 36x, and every single one of
+      // them was a rebuild frame with the fraction at 1.00. That is the
+      // sawtooth -- drift out along the secant, snap back on the rebuild --
+      // and it is a pop on 3.6% of rebuilds, which at 8 slots and 2.7
+      // rebuilds a second is something popping somewhere most seconds.
+      //
+      // Building at `u + one interval` instead puts the pair either side of
+      // the present. The fraction runs 0 -> 1 between rebuilds and reaches 1
+      // just as the next build lands, so the hand-over happens at the sample
+      // the two lines SHARE, where they agree exactly, instead of at the tip
+      // where they do not. The drawn parameter is unchanged -- the secant is
+      // still read at `u` -- so nothing lags; only the spacing of the two
+      // samples moves, and a secant read between its samples is both smaller
+      // in error and bounded, where one read past them is neither.
+      //
+      // The lead is the schedule's own QUANTUM, which is exact, and not the
+      // measured gap, which is not.
+      //
+      // A slot is due when `round(u * setSeconds * hz)` changes, so due
+      // events are exactly `1/(setSeconds*hz)` of parameter apart and no
+      // actual gap can be shorter than that -- only longer, when the budget
+      // defers one. Lead by the quantum and the fraction starts at
+      // `1 - quantum/gap`, which is 0 when the schedule kept up and positive
+      // when it did not: it can never put the older sample ahead of the
+      // present.
+      //
+      // The smoothed measured gap was the first thing tried here and it is
+      // the wrong quantity in the way that matters: it is an average of an
+      // irregular series, so it is larger than the gap about half the time,
+      // and each of those asks for a negative fraction. Measured, with the
+      // floor at -0.5 and then at -1.5: 9 and then 5 slot-frames of 10,552
+      // sat exactly on the floor, and every one of them was a jump of 9x to
+      // 26x the true motion -- a floor is a freeze, and the release is a
+      // step. The quantum does not have that failure mode at all.
+      //
+      // Lateness is unchanged: if the next rebuild misses its slot the
+      // fraction carries on past 1 and extrapolates as it always did,
+      // bounded by `blendMax` and `_btSafe`.
+      const lead = 1 / (this.setSeconds * this._hz);
+      const pu = u + lead;
       const r0 = now();
-      const spec = morphPath(SPECS, u);
+      const spec = morphPath(SPECS, pu);
       const b = build(spec);
-      // The palette on the same spline as the geometry. SPECS is in SET_NAMES
-      // order and palStopsAt returns the same four sets morphPath splined
-      // between, so the colour and the shape are never a segment apart.
+      // The palette on the same spline as the geometry, but at the DRAWN
+      // parameter rather than the built one: unlike the table, the palette is
+      // not blended as it is read -- a rebuild replaces it outright -- so the
+      // colour on screen should be the colour of where the morph is now, not
+      // of where the geometry sample was taken. `palT` is just the fractional
+      // position, which is `frac` below, so this costs no second spline.
+      // SPECS is in SET_NAMES order and palStopsAt returns the same four sets
+      // morphPath splines between, so the colour and the shape are never a
+      // segment apart.
       const ps = palStopsAt(SPECS, u);
       const pal = crPalette(
         PALETTES[ps[0].palette] || PALETTES.spectral,
         PALETTES[ps[1].palette] || PALETTES.spectral,
         PALETTES[ps[2].palette] || PALETTES.spectral,
         PALETTES[ps[3].palette] || PALETTES.spectral,
-        spec.palT, sh.palBuf);
+        u - Math.floor(u), sh.palBuf);
       sh.att.reparam({
         maps: b.maps, trunkA: b.trunkA, sig0: b.sig0, mu0: b.mu0,
         omega: spec.omega ?? 0.28,
@@ -905,14 +1092,17 @@ export class ShapePool {
       // interval it covers is the one that actually happened rather than the
       // one that was expected.
       // The two tables are now the builds at uA and uB, and the drawn shape
-      // is the line through them read at wherever the morph has got to.
+      // is the line through them read at wherever the morph has got to --
+      // which is now BETWEEN them rather than beyond both.
       sh.uA = sh.uB;
-      sh.uB = u;
+      sh.uB = pu;
       const gap = this._clock - sh.builtAt;
       sh.gapEst = sh.gapEst > 0 ? sh.gapEst + (gap - sh.gapEst) * 0.25 : gap;
       sh.builtAt = this._clock;
       sh.name = frac < 0.5 ? sh.from : sh.to;
       sh.rebuilds++;
+      this._builtK[best] = 1;
+      this._accReb++;
       const cost = now() - r0;
       this.reparamMs += cost;
       this.rebuildsThisFrame++;
@@ -940,10 +1130,12 @@ export class ShapePool {
         const sh = this.shapes[k];
         const u = this._u + (k * N) / this.slots;
         const span = sh.uB - sh.uA;
-        sh.att.setBlend(span > 1e-12 ? (u - sh.uA) / span : 1, this.blendMax);
+        sh.att.setBlend(span > 1e-12 ? (u - sh.uA) / span : 1,
+                        this.blendMax, this.blendMin);
       }
     }
     this.deferred = nDue;
+    this._meter(dt);
     this.lastMs = now() - t0;
   }
 }
