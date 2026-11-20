@@ -1358,7 +1358,16 @@ const RF0 = new Float64Array(9), RF1 = new Float64Array(9), RFB = new Float64Arr
 // ------------------------------------------------------------- the stream
 
 export class AdaptiveStream {
-  constructor(att, maxSplats = 400000) {
+  /**
+   * `store` lets the caller supply the memory and the slice of it to use:
+   * {buffer, splatOffset}, where buffer is an ArrayBuffer or a
+   * SharedArrayBuffer of at least 41 bytes a splat for `maxSplats` starting at
+   * that offset.  It is how a shard walks straight into the region the GPU
+   * will be uploaded from, with nothing copied anywhere -- see js/shard.js.
+   *
+   * Left out, the stream allocates its own, which is every existing caller.
+   */
+  constructor(att, maxSplats = 400000, store = null) {
     this.att = att;
     this.max = maxSplats;
     // One allocation, four views into it, at the same indices they always
@@ -1380,10 +1389,19 @@ export class AdaptiveStream {
     // ArrayBuffer, so a worker can hand it over with a single transfer
     // instead of four, and a ring slot is one object rather than four.
     const STRIDE = 3 * 4 + 6 * 4 + 4 + 1;        // 41 bytes a splat
-    this.bytes = new ArrayBuffer(STRIDE * maxSplats);
-    this.pos = new Float32Array(this.bytes, 0, 3 * maxSplats);
-    this.cov = new Float32Array(this.bytes, 12 * maxSplats, 6 * maxSplats);
-    this.rgba = new Uint8Array(this.bytes, 36 * maxSplats, 4 * maxSplats);
+    // Where the four blocks start, relative to this stream's own base.  The
+    // float views need a 4-byte-aligned byteOffset, and 12 * maxSplats is a
+    // multiple of 4 for any integer maxSplats -- but a caller-supplied base
+    // is not, so it is rounded up here rather than trusted.
+    const base = store ? Math.ceil((store.splatOffset ?? 0) * STRIDE / 4) * 4 : 0;
+    this.bytes = store ? store.buffer : new ArrayBuffer(STRIDE * maxSplats);
+    this.base = base;
+    this.shared = !!store;
+    if (this.bytes.byteLength < base + STRIDE * maxSplats)
+      throw new Error(`stream store too small: need ${STRIDE * maxSplats} bytes at ${base}`);
+    this.pos = new Float32Array(this.bytes, base, 3 * maxSplats);
+    this.cov = new Float32Array(this.bytes, base + 12 * maxSplats, 6 * maxSplats);
+    this.rgba = new Uint8Array(this.bytes, base + 36 * maxSplats, 4 * maxSplats);
     // Which look-effects each splat's OBJECT permits, one byte per splat.
     //
     // A separate array rather than bits stolen from rgba's alpha. Alpha is
@@ -1393,10 +1411,12 @@ export class AdaptiveStream {
     // reference bit for bit. Adding a field beside them cannot disturb that;
     // repacking one of them would have put a cosmetic feature in a position
     // to break the generator's correctness proof.
-    this.fx = new Uint8Array(this.bytes, 40 * maxSplats, maxSplats);
+    this.fx = new Uint8Array(this.bytes, base + 40 * maxSplats, maxSplats);
     this.curFx = 0xff;   // what the object being expanded right now allows
     // A stable identity per splat, so a test can tell "this blob faded" from
     // "this blob vanished".  Not uploaded; the renderer never needs it.
+    // Not uploaded and not shared: the renderer never needs it, so it stays
+    // out of the region a shard hands to the GPU.
     this.id = new Uint32Array(maxSplats);
     this.count = 0;
     this.nodes = 0;
