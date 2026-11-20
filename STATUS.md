@@ -789,6 +789,53 @@ The round that followed "look more on optimizations that can be done to increase
 things were costed; four were built, two were argued out of existence with arithmetic that is
 recorded in [IDEAS.md](IDEAS.md) rather than discovered again later.
 
+**Two bugs shipped in this round, both in the same twenty lines, both found by
+a person looking at a screen rather than by a test.** The second is the more
+embarrassing, because the fix for the first is what exposed it.
+
+**One: the frame term charged the splats for the whole frame.** Covered below.
+One splat, 900 px across.
+
+**Two: the refresh period was the running minimum of the frame intervals.**
+That assumes the only way a `requestAnimationFrame` callback can be wrong is to
+be late. It is not: after a long frame the browser catches up and delivers the
+next one almost immediately, so a 60 Hz display hands out the occasional 6 ms
+gap. A minimum believes it. The budget becomes 0.85 x 6 ms, the controller
+spends the rest of the session chasing 200 fps, and it takes detail away every
+frame trying to get there -- a scene that starts as a fractal and shrinks away,
+which is exactly how it was reported. One such gap cut a 255k-splat scene to
+88k and left it oscillating twenty seconds later.
+
+The fix is one fact: **a vsync-locked interval is an integer multiple of the
+period.** So a 6 ms gap cannot be a 60 Hz period -- 16.67 is not a multiple of
+6, and the window says so. The period is the largest observed interval that
+explains 70% of the rest as multiples of itself, which is the greatest common
+divisor give or take a tolerance, remembered across windows because a machine
+that never lands a frame on time has no evidence of its own refresh rate. A
+plain low percentile was the first attempt and is not enough: it is robust to
+the early callbacks but it cannot tell a 30 Hz display from a 60 Hz one missing
+every frame.
+
+Spurious gaps every 30th frame, every 4th frame, and every other frame missed
+now all read 16.67 ms and all cost **no detail whatever** against a clean 60 --
+255,565 splats in every case. A real 120 Hz display reads 8.33, and a display
+changed mid-session is followed inside two seconds.
+
+**And a third, caught on the way:** the first fix for bug one had the frame term
+stand down when the floor owned the budget, leaving the walk clock in charge.
+With only the walk clock to answer to the detail runs free -- on a 120 Hz
+display whose floor is 6.5 ms of a 7.0 ms budget, 1.2 million splats in a 42 ms
+frame. The splats now always get a share of the budget and the share is always
+bounded: at least 1.5 ms, at most the real headroom. A 15 ms floor against a
+14.2 ms budget gives 49,148 splats in a 16.5 ms frame.
+
+The lesson is not that the controller needed more care. It is that **three of
+these four faults are a measurement believed without asking what else could
+produce that number** -- a short interval taken for a fast display, a whole
+frame taken for the splats' doing, a settled loop taken for a loop with nothing
+to say. The tests that missed them were written from the same assumptions as
+the code.
+
 **What shipped broken, and what it cost to find out.** The first frame term
 divided the whole frame by the budget. That is wrong in a way that destroys the
 scene rather than merely mistuning it: the sky, the pool rebuild, the uniforms

@@ -28,6 +28,31 @@ reading; and the sky is drawn at half resolution and stretched, which is a quart
 fragments and is the new `half-res sky` switch on the panel -- the lobes are unchanged by it and
 the stars come out twice as wide, so it is a switch and not a silent default.
 
+Republished 2026-11-20, twice more, for two faults in the detail controller that only a real
+screen could show -- both reported from one, within the hour of the first publish.
+
+The first charged the splats for the whole frame. The sky, the pool rebuild and the present cost
+the same whether there are 300k splats or one, so when that floor alone exceeded the budget no
+number of splats satisfied the controller: it pushed the threshold to its clamp and pinned it
+there. One splat, 900 px across, and a detail key that could not win. The frame is split now, by
+fitting what a splat actually costs.
+
+The second read the refresh period as the least frame interval ever seen. requestAnimationFrame
+runs EARLY as well as late -- after a long frame the browser catches up and delivers the next
+callback almost immediately -- so a 60 Hz display hands out the occasional 6 ms gap, and a minimum
+believes it. The budget became 0.85 x 6 ms and the controller spent the session chasing 200 fps,
+taking detail away every frame to get there: a scene that starts as a fractal and shrinks away.
+The period is read from a window now, as the largest interval that explains the rest as integer
+multiples of itself, which is what a vsync-locked interval always is.
+
+Three query parameters exist because of all that, and are the first thing to try rather than the
+last:
+
+    ?frameterm=0    budget on the walk clock alone, as it did before any of the throughput work.
+                    The one to reach for if the scene thins out or shrinks away.
+    ?refresh=16.7   pin the refresh period instead of observing it.
+    ?lod=2.5        start the detail threshold here instead of at 4.
+
 js/shard.js is NOT published: it splits the expansion walk across threads, and in a browser that
 needs SharedArrayBuffer and therefore cross-origin isolation, which is two nginx headers and
 task 3 in root.md. Nothing in the page imports it yet, so it stays out on the same terms as the

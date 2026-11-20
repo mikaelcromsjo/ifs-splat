@@ -87,6 +87,24 @@ transcribing them to the CPU and comparing against the Python reference, which p
 and says nothing about whether they compile. The compute kernel reproduces the CPU expansion with
 **0 wrong draw slots out of 114,687** — a statement about arithmetic, not about drivers.
 
+That gap is not theoretical. The detail controller shipped with two faults that no test here
+could see, both found by someone looking at a real screen: it charged the splats for the whole
+frame including the sky, and it read the refresh period as the least frame interval ever seen,
+which a browser supplies wrongly because `requestAnimationFrame` runs early as well as late. The
+first emptied the screen to a single splat; the second made the controller chase 200 fps and
+shrink the scene away. Both are fixed, both now have a scenario in `tests/budget.mjs`, and the
+reason the original scenarios missed them is that they were written from the same assumptions as
+the code. MEASURED.md carries the arithmetic.
+
+Because of that, the published page takes three escape hatches as query parameters, so a wrong
+guess about a real machine does not need a new build to work around:
+
+| | |
+|---|---|
+| `?frameterm=0` | budget on the walk clock alone — exactly the behaviour before any of the throughput work. **The one to reach for if the scene thins out or shrinks away.** |
+| `?refresh=16.7` | pin the refresh period instead of observing it, for a display whose frame intervals are not telling the truth |
+| `?lod=2.5` | start the detail threshold here instead of at 4 |
+
 The throughput work adds to that list rather than shrinking it: `EXT_disjoint_timer_query_webgl2`,
 the half-resolution sky's framebuffer and its upsample program, and the ring of upload buffers are
 all going out to real drivers unexercised. Each one fails soft — a missing timer query falls back

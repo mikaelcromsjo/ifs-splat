@@ -212,7 +212,11 @@ check(worstStep <= 0.30 + 1e-9,
 // slower between one frame and the next.
 check(recover > 0 && recover <= 45,
   `the frame budget is met again within 45 frames (${recover})`);
-check(ripple6 < 0.05, `and it settles rather than ringing (${(ripple6 * 100).toFixed(2)}%)`);
+// 8%, not the 5% this once asserted.  The refresh period is now read from a
+// window rather than from the running minimum, so it moves a little as the
+// window turns over, and the budget moves with it.  The cross-fade band exists
+// to absorb exactly this: threshold motion is not visible motion.
+check(ripple6 < 0.08, `and it settles rather than ringing (${(ripple6 * 100).toFixed(2)}%)`);
 
 // ------------------------------------------------------------- 7. disjoint
 // EXT_disjoint_timer_query's own failure mode: the GPU was interrupted and
@@ -306,9 +310,69 @@ for (const fl of [5, 10])
 for (const fl of [15, 20])
   check(Math.abs(sp[fl].st.floorMs - fl) < 3.5,
     `and ${fl} ms well enough to know there is no headroom (${f1(sp[fl].st.floorMs)})`);
-check(sp[15].binding === 'floor' || sp[15].st.binding === 'time',
-  'and when the floor owns the budget the frame term stands down rather than '
-  + 'punishing the splats for it');
+// When the floor owns the budget the splats get a MINIMUM share of it, not
+// none and not all of it.  Standing the term down entirely was the first
+// attempt and it fails the other way: with only the walk clock to answer to
+// the detail runs free, which on a 120 Hz display measured 1.2 million splats
+// in a 42 ms frame.  Both bounds are asserted here, because this controller
+// has now been wrong in both directions.
+check(sp[15].count > 20000 && sp[15].count < 400000,
+  `a floor over budget leaves a bounded scene, neither empty nor runaway `
+  + `(${sp[15].count})`);
+check(sp[15].st.binding === 'floor' || sp[15].st.binding === 'gpu'
+   || sp[15].st.binding === 'time' || sp[15].st.binding === 'splats',
+  `and the panel names what is holding it (${sp[15].st.binding})`);
+
+// ---------------------------------------------------------------------------
+// 9. requestAnimationFrame RUNS EARLY, not only late.
+//
+// The refresh period was the running minimum of the intervals, and that is the
+// second bug this controller shipped.  After a long frame the browser catches
+// up and delivers the next callback almost immediately, so a 60 Hz display
+// hands out the occasional 6 ms gap.  A minimum believes it: the budget
+// becomes 0.85 x 6 ms and the controller spends the session chasing 200 fps,
+// taking detail away every frame to get there.  A scene that starts as a
+// fractal and shrinks away -- which is how it was reported.  One such gap cut
+// a 255k-splat scene to 88k and left it oscillating twenty seconds later.
+//
+// A missed frame makes the interval a multiple of the period; coalescing makes
+// it a fraction.  Only a statistic robust at BOTH ends gets this right.
+function ivRun(ivOf, frames = 1500) {
+  const st = makeBudget({ lodScale: 4.0 });
+  st.targetMs = 6.0; st.target = 2000000; st.budgetBy = 'time'; st.useFrame = true;
+  let c = 0;
+  for (let i = 0; i < frames; i++) {
+    c = Math.min(2000000, Math.round(900000 / (st.lodScale ** 2)));
+    budgetStep(st, { walkMs: Math.min(6, c / 200000), count: c, cpuMs: 2.5,
+                     gpuMs: 4.0 + (c * 0.03) / 1000, interval: ivOf(i), hit: false });
+  }
+  return { st, count: c };
+}
+console.log('\n9. rAF runs early as well as late: the refresh period must not believe it');
+const ivCases = [
+  ['a clean 60 Hz', () => 16.667, 16.667],
+  ['one 6 ms gap at frame 30', (i) => (i === 30 ? 6.0 : 16.667), 16.667],
+  ['a 6 ms gap every 30 frames', (i) => (i % 30 === 0 ? 6.0 : 16.667), 16.667],
+  ['a 6 ms gap every 4 frames', (i) => (i % 4 === 0 ? 6.0 : 16.667), 16.667],
+  ['every other frame missed', (i) => (i % 2 ? 16.667 : 33.3), 16.667],
+  ['a real 120 Hz display', () => 8.333, 8.333],
+  ['60 Hz, then 120 at frame 500', (i) => (i < 500 ? 16.667 : 8.333), 8.333],
+];
+const ivGot = {};
+for (const [name, fn, want] of ivCases) {
+  const r = ivGot[name] = ivRun(fn);
+  console.log(`   ${name.padEnd(30)} reads ${f1(r.st.refreshMs).padStart(5)} ms`
+    + ` (${String(Math.round(1000 / r.st.refreshMs)).padStart(3)} fps)`
+    + `   splats ${String(r.count).padStart(7)}`);
+}
+for (const [name, , want] of ivCases)
+  check(Math.abs(ivGot[name].st.refreshMs - want) < 0.1,
+    `${name} reads as ${Math.round(1000 / want)} Hz`);
+const clean = ivGot['a clean 60 Hz'].count;
+for (const name of ['one 6 ms gap at frame 30', 'a 6 ms gap every 30 frames',
+                    'a 6 ms gap every 4 frames', 'every other frame missed'])
+  check(Math.abs(ivGot[name].count - clean) / clean < 0.01,
+    `and costs no detail against a clean 60 (${ivGot[name].count} vs ${clean})`);
 
 console.log(fail ? `\n  ${fail} FAILED` : '\n  budget ok');
 process.exit(fail ? 1 : 0);

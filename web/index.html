@@ -206,6 +206,27 @@ try {
   const v = new Viewer($('gl'));
   // So a pasted log says which copy of the demo produced it.
   v.jumpLog.build = BUILD;
+
+  // ESCAPE HATCHES, because the detail controller has now been wrong twice in
+  // ways only a real screen could show, and waiting for a fix is not a plan.
+  //
+  //   ?frameterm=0   the controller ignores the frame entirely and budgets on
+  //                  the walk clock alone -- exactly how it behaved before any
+  //                  of the throughput work, and the setting to reach for if
+  //                  the scene thins out or shrinks away.
+  //   ?refresh=16.7  pin the refresh period instead of observing it, for a
+  //                  display whose intervals are not telling the truth.
+  //   ?lod=2.5       pin the detail threshold outright: the controller may
+  //                  still move it, but it starts here rather than at 4.
+  try {
+    const q = new URLSearchParams(location.search);
+    const st = v.stream;
+    if (q.get('frameterm') === '0') { st.useFrame = false; st.bud.useFrame = false; }
+    const rf = parseFloat(q.get('refresh'));
+    if (rf > 0) { st.bud.refreshMs = rf; st.bud.ivPinned = true; }
+    const ld = parseFloat(q.get('lod'));
+    if (ld > 0) st.lodScale = ld;
+  } catch (_) { /* a hatch that throws is worse than no hatch */ }
   const ms = (x) => x.toFixed(2) + ' ms';
 
   // The look toggles.  These are masters: each object already chose which

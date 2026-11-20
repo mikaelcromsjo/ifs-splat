@@ -111,6 +111,72 @@ export const LS_MAX = 64;
  *  not a refresh period -- it is a stall, or a clock with no vsync at all. */
 export const REFRESH_LO = 5.0, REFRESH_HI = 40.0;
 
+/** The window of recent intervals, how many are needed before it is read, how
+ *  often it is read, how near a multiple an interval must be to count as one,
+ *  and the fraction of the window a candidate must explain. */
+// IV_MIN is 4 and not 24 because the early intervals are the only ones that
+// ever show the true period on a machine that cannot keep up: the scene starts
+// coarse and those first frames land on time, and by frame twenty the detail
+// has grown and every interval is a multiple.  The window's answer can only
+// LOWER the remembered period, and a wrong low value cannot get in anyway --
+// it would have to divide 70% of the intervals.
+export const IV_WIN = 120, IV_MIN = 4, IV_EVERY = 5;
+// 0.7, not 0.9: a quarter of the callbacks arriving early is not rare, and a
+// candidate has to survive that to be found at all.
+export const IV_TOL = 0.12, IV_EXPLAIN = 0.7;
+
+/**
+ * The refresh period from a window of frame intervals.
+ *
+ * A VSYNC-LOCKED INTERVAL IS AN INTEGER MULTIPLE OF THE PERIOD.  That one fact
+ * is the whole estimator, and not having used it is the second bug this
+ * controller shipped.  The period was the running minimum of the intervals,
+ * which assumes rAF only ever runs LATE.  It does not: after a long frame the
+ * browser catches up and delivers the next callback almost immediately, so a
+ * 60 Hz display hands out the occasional 6 ms gap.  A minimum believes it, the
+ * budget becomes 0.85 x 6 ms, and the controller spends the session chasing
+ * 200 fps -- taking detail away every frame to get there.  A scene that starts
+ * as a fractal and shrinks away, which is how it was reported.
+ *
+ * A 6 ms gap cannot be a 60 Hz period, and the window says so: 16.67 is not a
+ * multiple of 6.  So the candidates are the intervals actually observed, and
+ * the answer is the LARGEST of them that explains the rest as multiples of
+ * itself -- which is the greatest common divisor, give or take the tolerance.
+ * A plain low percentile was the first attempt and it is not enough either: it
+ * is robust to the early callbacks but it cannot tell a 30 Hz display from a
+ * 60 Hz one missing every frame, and the long memory below is what settles
+ * that, from whatever on-time frames were seen while the scene was still
+ * coarse.
+ *
+ * Returns 0 when nothing explains the window, and the caller keeps what it
+ * had: a window with no majority has nothing to say.
+ */
+export function periodOf(ring, n) {
+  // Candidates, largest first, bucketed to a quarter of a millisecond so that
+  // a hundred near-identical intervals are one candidate and not a hundred.
+  const seen = new Set(), cand = [];
+  for (let i = 0; i < n; i++) {
+    const b = Math.round(ring[i] * 4);
+    // Bucketed so a hundred near-identical intervals are one candidate, but
+    // the candidate is the interval ITSELF and not the bucket's centre: a
+    // 60 Hz period is 16.667 ms and rounding it to 16.75 is a half-percent
+    // error in every budget that follows from it.
+    if (!seen.has(b)) { seen.add(b); cand.push(ring[i]); }
+  }
+  cand.sort((a, b) => b - a);
+  const need = n * IV_EXPLAIN;
+  for (const c of cand) {
+    if (c < REFRESH_LO) break;
+    let ok = 0;
+    for (let i = 0; i < n; i++) {
+      const r = ring[i] / c, k = Math.round(r);
+      if (k >= 1 && Math.abs(r - k) <= IV_TOL) ok++;
+    }
+    if (ok >= need) return c;
+  }
+  return 0;
+}
+
 export function makeBudget(opts = {}) {
   return {
     // what the rung asks for: the walk's own ceilings
@@ -126,6 +192,7 @@ export function makeBudget(opts = {}) {
     lodScale: opts.lodScale ?? 4.0,
     // observed, never configured
     refreshMs: 0,
+    ivRing: new Float64Array(IV_WIN), ivAt: 0, ivN: 0, ivPinned: false,
     floorMs: 0,
     fitMx: 0, fitMy: 0, fitCxx: 0, fitCxy: 0, fitN: 0, fitK: 0,
     emaFrame: 0,
@@ -157,9 +224,34 @@ export function budgetStep(st, m) {
   // not remembered for ever as "it was 16.7 ms once".
   const iv = m.interval;
   if (iv != null && iv >= REFRESH_LO && iv <= REFRESH_HI) {
-    st.refreshMs = st.refreshMs > 0
-      ? Math.min(iv, st.refreshMs * 1.0005)
-      : iv;
+    // A LOW PERCENTILE of the recent intervals, not the least of them.
+    //
+    // The running minimum was the first version and it is the second bug this
+    // controller shipped.  requestAnimationFrame does not only run late, it
+    // sometimes runs EARLY: after a long frame the browser catches up and
+    // delivers the next callback almost immediately, so a 60 Hz display hands
+    // out the occasional 6 ms gap.  A minimum believes it, the budget becomes
+    // 0.85 x 6 ms, and the controller spends the rest of the session chasing
+    // 200 fps -- taking detail away every frame to get there, which is a
+    // scene that starts as a fractal and shrinks away.  One such gap was
+    // enough to cut a 255k-splat scene to 88k and leave it oscillating
+    // twenty seconds later.
+    //
+    // A percentile is robust at both ends, and the two ends are not alike: a
+    // missed frame makes the interval a MULTIPLE of the period, while
+    // coalescing makes it a fraction.  The 25th discards the early ones
+    // without being dragged up by the late ones, and a 120-frame window
+    // follows a real change of display inside two seconds instead of the
+    // thirty-four a leaking minimum took.
+    st.ivRing[st.ivAt++ % IV_WIN] = iv;
+    if (st.ivN < IV_WIN) st.ivN++;
+    if (st.ivPinned) { /* pinned by ?refresh= : believe the caller, not rAF */ }
+    else if (st.ivN >= IV_MIN && st.ivAt % IV_EVERY === 0) {
+      const c = periodOf(st.ivRing, st.ivN);
+      if (c > 0) st.refreshMs = st.refreshMs > 0
+        ? Math.min(c, st.refreshMs * 1.0005)
+        : c;
+    }
   }
   if (iv != null) {
     st.emaFrame = st.emaFrame > 0
@@ -180,6 +272,16 @@ export function budgetStep(st, m) {
     if (m.gpuMs != null && m.gpuMs >= 0) {
       // Both sides of the fence, against a fraction of the refresh period.
       // Two-sided: this is the term that converts a cheaper draw into detail.
+      // The SUM, which is conservative and probably too much so: the CPU and
+      // the GPU pipeline across frames -- this frame's JS runs while the last
+      // frame's draw is still going, which is what the ring of upload buffers
+      // exists to allow -- so the sustained rate is nearer 1/max(cpu, gpu),
+      // and adding them overstates the frame by the whole overlap.  Switching
+      // to max() measured 33% more detail at the same frame rate here.  It is
+      // NOT done, because it moves the operating point far enough that the
+      // splat ceiling and the missed-frame question both come back, and those
+      // cannot be settled without a GPU.  It is a separate change, and it is
+      // the next one worth making.
       st.frameMs = (m.cpuMs ?? 0) + m.gpuMs;
       st.gpuMs = m.gpuMs;
       // ...but only against the part of the frame the detail can actually
@@ -228,20 +330,22 @@ export function budgetStep(st, m) {
       const k = st.fitK;
       st.floorMs = st.frameMs - k * m.count;
       const head = budget - st.floorMs;
-      if (k > 0 && head >= MIN_HEAD) {
+      if (k > 0) {
         // The splats' own share of the frame, against the share of the budget
-        // that is actually theirs to spend.  Two-sided, as before.
-        errF = (k * m.count) / head;
-        how = 'gpu';
-      } else if (k <= 0) {
-        how = 'warmup';
+        // that is theirs -- but never against less than MIN_HEAD of it.
+        //
+        // Standing the term down entirely when the floor ate the budget was
+        // the first attempt, and it fails the other way: with nothing but the
+        // walk clock to answer to, the detail runs free.  On a 120 Hz display
+        // whose floor is 6.5 ms of a 7.0 ms budget that came out as 1.2
+        // million splats and a 42 ms frame, eight times over.  So the splats
+        // always get a share and the share is always bounded: at least
+        // MIN_HEAD, at most the real headroom.  Neither an empty screen nor
+        // an unbounded one.
+        errF = (k * m.count) / Math.max(head, MIN_HEAD);
+        how = head >= MIN_HEAD ? 'gpu' : 'floor';
       } else {
-        // Less than MIN_HEAD of the budget is the splats' to give back. The
-        // frame cannot be made by drawing less, so this term has nothing to
-        // say and the walk clock governs -- the old, safe behaviour. The
-        // honest outcome is a scene that is still there and frames that are
-        // late, not an empty screen at a steady 60.
-        how = 'floor';
+        how = 'warmup';
       }
     } else {
       // No timer query.  All that is left is the interval, and a vsync-locked
