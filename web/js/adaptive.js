@@ -28,6 +28,7 @@
 import { mix, jitterRotInto, stream as jstream, normal as jnormal, h32, rootHash,
          BRANCH, TRUNK_A, MU0, SIG0, M_BR } from './ifs_core.js';
 import { invariantMoments, subtreeColours, opNorm } from './moments.js';
+import { makeBudget, budgetStep } from './budget.js';
 
 const now = () => (typeof performance !== 'undefined' ? performance.now()
                                                      : Number(process.hrtime.bigint()) / 1e6);
@@ -1422,6 +1423,17 @@ export class AdaptiveStream {
     this.budgetBy = 'time';
     this.lastMs = 0;
     this.budgetHit = false;
+    // The controller itself lives in budget.js, and these three are what the
+    // viewer fills in each frame so that it can see the GPU as well as the
+    // walk.  Left null they are simply absent from the error term, which is
+    // what every headless test wants: tour, legible and fidelity have no
+    // vsync and no timer query, and must keep measuring the walk-only
+    // controller they have always measured.
+    this.cpuMs = null;      // the frame's JS time, submission not completion
+    this.gpuMs = null;      // EXT_disjoint_timer_query_webgl2, if there is one
+    this.interval = null;   // ms between frame starts
+    this.useFrame = true;
+    this.bud = makeBudget({ lodScale: 4.0 });
     // Front-to-back occlusion.  The attractor's projected area grows with
     // depth -- 4^k subtrees each covering (0.6^k)^2 is 1.44^k -- so overdraw
     // rises without bound as the LOD cut descends, and almost all of it is
@@ -1552,25 +1564,20 @@ export class AdaptiveStream {
       // without reliably shortening the draw. Taking the worse of the two
       // errors lets whichever budget binds first drive the threshold: the
       // clock on a slow machine, the splat count on a fast one.
-      const errT = this.lastMs / this.targetMs;
-      const errN = c / Math.max(this.target, 1);
-      const err = this.budgetBy === 'time' ? errT
-                : this.budgetBy === 'splats' ? errN
-                : Math.max(errT, errN);
-      // The threshold is a controller, and like any causal controller it is
-      // caught out when the view changes faster than it can track: climb out
-      // of an attractor facing away, see almost nothing, let the threshold
-      // fall -- then turn round, and that one frame lands at the cap.
-      //
-      // There is no fix for that in principle, only a budget for how bad it
-      // may get.  Bound how far a single frame may move the threshold, let it
-      // come back up three times faster than it goes down, and cap the stream
-      // so the worst frame is a large upload rather than an unbounded one.
-      // Recovery from a hit is about three frames.
-      const g = Math.pow(Math.max(err, 1e-3), this.budgetHit ? 0.5 : 0.22);
-      const lo = this.budgetHit ? 1.0 : 0.80, hi = this.budgetHit ? 3.0 : 1.30;
-      this.lodScale *= Math.max(lo, Math.min(hi, g));
-      this.lodScale = Math.max(0.05, Math.min(1000, this.lodScale));
+      // The error term, the damping and the bounds are all in budget.js now,
+      // because the frame term needed a clock and an observed refresh period
+      // and this method is not the place for either. `lodScale` stays a plain
+      // field rather than becoming an accessor on the budget state: it is read
+      // once per node in visit(), the hottest loop in the program, and a
+      // property read through a getter there is not worth the tidiness.
+      const b = this.bud;
+      b.targetMs = this.targetMs; b.target = this.target;
+      b.budgetBy = this.budgetBy; b.useFrame = this.useFrame;
+      b.lodScale = this.lodScale;
+      budgetStep(b, { walkMs: this.lastMs, count: c, cpuMs: this.cpuMs,
+                      gpuMs: this.gpuMs, interval: this.interval,
+                      hit: this.budgetHit });
+      this.lodScale = b.lodScale;
     }
     return c;
   }

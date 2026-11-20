@@ -15,6 +15,7 @@ import { expand, orderFrame, makeScratch } from './ifs_core.js';
 import { ExactSorter } from './sort_exact.js';
 import { InversionCounter } from './inversions.js';
 import { vertexSource, FRAG, BG_VERT, BG_FRAG } from './shaders.js';
+import { GpuClock } from './budget.js';
 import { AdaptiveStream, PALETTES } from './adaptive.js';
 import { World, FieldWorld, VoidCamera, Autopilot, ringLayout } from './world.js';
 import { JumpLog } from './mark.js';
@@ -221,6 +222,12 @@ export class Viewer {
     this.jumpLog = new JumpLog({ build: this.opts.build ?? 'dev' });
     this._frames = 0; this._t0 = performance.now(); this._last = this._t0;
     this.keys = new Set();
+    // The GPU's own clock.  Without it the detail controller is blind to
+    // everything after the walk -- see budget.js, which carries the argument.
+    // Absent extension is not an error: the controller falls back to a brake
+    // on the frame interval and behaves as it always did.
+    this.clock = new GpuClock(gl);
+    this._cpuMs = 0;
 
     // Which rung the ladder starts on: whichever one the configured budget
     // asks for, so opts.targetMs stays the single default and this does not
@@ -659,8 +666,23 @@ export class Viewer {
 
   frame() {
     const gl = this.gl, t0 = performance.now();
-    const dt = Math.min((t0 - this._last) / 16.67, 4);     // in 60fps ticks
+    const interval = t0 - this._last;                      // ms, frame to frame
+    const dt = Math.min(interval / 16.67, 4);              // in 60fps ticks
     this._last = t0;
+    // What the detail controller is told, before the walk that reads it.
+    //
+    // All three are LAST frame's: the JS time measured at the bottom of this
+    // method, the timer query's result, which lands a frame or two after the
+    // frame it timed, and the interval just taken.  A controller damped over
+    // tens of frames does not care, and nothing here can know this frame's
+    // cost before doing it.
+    if (this.stream) {
+      const st = this.stream;
+      st.interval = interval;
+      st.cpuMs = this._cpuMs;
+      st.gpuMs = this.clock.ms;
+    }
+    this.clock.begin();
     this.resize();
     const W = this.canvas.width, H = this.canvas.height;
     const f = (H / 2) / Math.tan((this.opts.fovy * Math.PI) / 360);
@@ -677,7 +699,19 @@ export class Viewer {
     if (this.scene === 'void') this.frameFlight(dt, W, H, f);
     else this.frameObject(W, H, f);
 
-    this.stats.frame = performance.now() - t0;
+    this._cpuMs = performance.now() - t0;
+    this.stats.frame = this._cpuMs;
+    // Closing the query is the last GL call of the frame, so it spans every
+    // draw above it.  `gpu` is a frame or two stale and null where the
+    // extension is missing, which the panel shows as a dash rather than a
+    // zero -- a zero would read as "the GPU costs nothing".
+    this.stats.gpu = this.clock.end();
+    const b = this.stream && this.stream.bud;
+    if (b) {
+      this.stats.refresh = b.refreshMs;
+      this.stats.binding = b.binding;
+      this.stats.lodScale = this.stream.lodScale;
+    }
     this._frames++;
     if (t0 - this._t0 > 500) {
       this.stats.fps = (this._frames * 1000) / (t0 - this._t0);

@@ -1,0 +1,242 @@
+// The detail controller, driven with synthetic load.
+//
+// The controller decides how much detail is on screen, and until now its only
+// input was the walk's own time -- so a cheaper DRAW produced no more detail,
+// it just left the frame half empty (budget.js carries the argument).  The
+// frame term that fixes that cannot be tested in a browser from here: there is
+// no GL and no vsync on this machine.  What can be tested is the arithmetic,
+// which is the part with a quiet way to be wrong.
+//
+// So: a toy world where splat count is a known function of the threshold, a
+// cost model that turns splats into milliseconds, and a loop that asks whether
+// the controller lands where it should and stays there.
+//
+// The model.  The LOD threshold is a length on screen and the splat count goes
+// about as its square, which is the reason the detail ladder doubles: so
+//   count   = K / lodScale^2
+//   walkMs  = count / WALK_RATE
+//   gpuMs   = count / GPU_RATE + gpuFixed
+// The rates are per-millisecond throughputs, i.e. exactly what items 2-6 of
+// this round of work change.  Nothing here claims those are real numbers for
+// any real machine; what is being checked is the loop's response to them.
+import { makeBudget, budgetStep, FRAME_FILL, MISS_AT } from '../js/budget.js';
+
+const K = 900000;                       // splats at lodScale 1
+const count = (ls) => K / (ls * ls);
+
+function run(opts) {
+  const { frames = 600, walkRate = 60000, gpuRate = 90000, gpuFixed = 1.5,
+          refresh = 16.667, haveQuery = true, targetMs = 6, target = 96000,
+          budgetBy = 'both', useFrame = true, lodScale = 4.0, maxSplats = 400000,
+          cpuFixed = 0.8 } = opts;
+  const st = makeBudget({ targetMs, target, budgetBy, useFrame, lodScale });
+  const hist = [];
+  for (let i = 0; i < frames; i++) {
+    const c0 = count(st.lodScale);
+    const hit = c0 > maxSplats;
+    const c = Math.min(c0, maxSplats);
+    const walkMs = c / walkRate;
+    const gpuMs = c / gpuRate + gpuFixed;
+    const cpuMs = walkMs + cpuFixed;
+    // A vsync-locked display: the frame lands on a refresh boundary, so the
+    // interval is the period until the work no longer fits, and then it is
+    // however many periods it does take.  This is exactly why the interval
+    // alone cannot say how much headroom there is.
+    const workMs = cpuMs + gpuMs;
+    const interval = refresh * Math.max(1, Math.ceil(workMs / refresh));
+    budgetStep(st, { walkMs, count: c, cpuMs,
+                     gpuMs: haveQuery ? gpuMs : null, interval, hit });
+    hist.push({ ls: st.lodScale, c, walkMs, gpuMs, cpuMs, interval,
+                binding: st.binding, err: st.err });
+  }
+  const tail = hist.slice(-120);
+  const mean = (f) => tail.reduce((a, h) => a + f(h), 0) / tail.length;
+  const lsMin = Math.min(...tail.map((h) => h.ls));
+  const lsMax = Math.max(...tail.map((h) => h.ls));
+  return { st, hist, tail,
+           ls: mean((h) => h.ls), splats: mean((h) => h.c),
+           walkMs: mean((h) => h.walkMs), gpuMs: mean((h) => h.gpuMs),
+           frameMs: mean((h) => h.cpuMs + h.gpuMs),
+           interval: mean((h) => h.interval),
+           // peak-to-peak of the threshold over the settled tail, as a
+           // fraction of its own mean: this is the pumping test
+           ripple: (lsMax - lsMin) / mean((h) => h.ls),
+           binding: tail[tail.length - 1].binding };
+}
+
+let fail = 0;
+const check = (ok, msg) => { console.log((ok ? '  ok    ' : '  FAIL  ') + msg); if (!ok) fail++; };
+const f1 = (x) => x.toFixed(1);
+
+console.log('The detail controller, on a toy world: count = 900000 / lodScale^2\n');
+
+// ---------------------------------------------------------------- 1. the old
+// Walk-only, which is what every headless test in this repository measures and
+// what the browser did before budget.js existed.  It must still hold the walk
+// at its target and must NOT be moved by anything downstream.
+const walkOnly = run({ useFrame: false, budgetBy: 'time', target: 0 });
+console.log('1. walk-only (the controller as it was)');
+console.log(`   lodScale ${f1(walkOnly.ls)}  splats ${Math.round(walkOnly.splats)}`
+  + `  walk ${f1(walkOnly.walkMs)} ms  frame ${f1(walkOnly.frameMs)} ms`
+  + `  interval ${f1(walkOnly.interval)} ms`);
+check(Math.abs(walkOnly.walkMs - 6) < 0.3, `holds the walk at its 6 ms target (${f1(walkOnly.walkMs)})`);
+check(walkOnly.ripple < 0.02, `and does not pump (${(walkOnly.ripple * 100).toFixed(2)}% ripple)`);
+
+// The fault being fixed, stated as a measurement: with the walk-only
+// controller, a frame that cannot fit in a refresh period is held anyway.
+const overloaded = run({ useFrame: false, budgetBy: 'time', target: 0, gpuRate: 12000 });
+console.log('\n2. walk-only, with a GPU 7.5x slower');
+console.log(`   lodScale ${f1(overloaded.ls)}  splats ${Math.round(overloaded.splats)}`
+  + `  walk ${f1(overloaded.walkMs)} ms  frame ${f1(overloaded.frameMs)} ms`
+  + `  interval ${f1(overloaded.interval)} ms`);
+check(Math.abs(overloaded.ls - walkOnly.ls) < 0.05,
+  'the threshold is identical -- the controller cannot see the GPU at all');
+check(overloaded.interval > 2.5 * 16.667,
+  `so the frame rate collapses unchecked (${f1(1000 / overloaded.interval)} fps)`);
+
+// ------------------------------------------------------------- 3. the brake
+// No timer query: the interval is all there is, and a vsync-locked frame holds
+// at the period however much headroom is left -- so the brake can only learn
+// by missing.  What it must not do is oscillate: grant detail, miss, take it
+// away, grant it again.  That is the limit cycle the latch and the remembered
+// cliff exist to break, and the ripple figure is the test of them.
+const brake = run({ haveQuery: false, budgetBy: 'time', target: 0, gpuRate: 12000 });
+console.log('\n3. the same slow GPU, no timer query: the interval brake');
+console.log(`   lodScale ${f1(brake.ls)}  splats ${Math.round(brake.splats)}`
+  + `  frame ${f1(brake.frameMs)} ms  interval ${f1(brake.interval)} ms`
+  + `  ripple ${(brake.ripple * 100).toFixed(1)}%`);
+check(brake.ls > overloaded.ls * 1.3,
+  `detail is given up (threshold ${f1(brake.ls)} against ${f1(overloaded.ls)})`);
+check(brake.interval < 16.667 * MISS_AT,
+  `and frames stop being missed (${f1(brake.interval)} ms, ${f1(1000 / brake.interval)} fps)`);
+check(brake.ripple < 0.10,
+  `without pumping: the remembered cliff holds it steady (${(brake.ripple * 100).toFixed(1)}% ripple)`);
+
+// The brake must be a brake and nothing more: with frames on time it may not
+// grant detail the walk budget has not granted.
+const idle = run({ haveQuery: false, budgetBy: 'time', target: 0 });
+check(Math.abs(idle.ls - walkOnly.ls) < 1e-9,
+  'with frames on time the brake is inert -- bit-identical to walk-only');
+
+// ------------------------------------------------------------ 4. the point
+// With a timer query the term is two-sided, so a cheaper draw becomes detail.
+//
+// The rung's own ceilings are set generously here (the `highest` rung's 24 ms
+// against a 600k splat cap) so that the GPU is what binds.  That is not a
+// contrivance: when the detail dial is up and the walk is cheap, the draw IS
+// the constraint, and before this change nothing in the engine could tell.
+const RUNG = { targetMs: 24, target: 600000, maxSplats: 800000 };
+const slow = run({ ...RUNG, gpuRate: 30000 });
+const fast = run({ ...RUNG, gpuRate: 60000 });
+console.log('\n4. with a timer query: a cheaper draw becomes detail');
+console.log(`   GPU 30k splats/ms:  lodScale ${f1(slow.ls)}  splats ${Math.round(slow.splats)}`
+  + `  frame ${f1(slow.frameMs)} ms  binding ${slow.binding}`);
+console.log(`   GPU 60k splats/ms:  lodScale ${f1(fast.ls)}  splats ${Math.round(fast.splats)}`
+  + `  frame ${f1(fast.frameMs)} ms  binding ${fast.binding}`);
+check(fast.splats > slow.splats * 1.3,
+  `doubling draw throughput buys ${(fast.splats / slow.splats).toFixed(2)}x the splats`);
+check(slow.binding === 'gpu' && fast.binding === 'gpu',
+  `and the controller says so: binding term is ${slow.binding}/${fast.binding}`);
+check(slow.frameMs < 16.667 * FRAME_FILL * 1.08
+   && fast.frameMs < 16.667 * FRAME_FILL * 1.08,
+  `both land under ${(FRAME_FILL * 100) | 0}% of the refresh period `
+  + `(${f1(slow.frameMs)} and ${f1(fast.frameMs)} ms of 16.7)`);
+check(slow.ripple < 0.08 && fast.ripple < 0.08,
+  `and neither pumps (${(slow.ripple * 100).toFixed(1)}% and ${(fast.ripple * 100).toFixed(1)}%)`);
+
+// The walk ceiling still binds when it is the tighter of the two: a fast GPU
+// must not be allowed to drive the walk past its own budget, nor the splat
+// count past the rung's.
+const fastGpu = run({ gpuRate: 1e9, gpuFixed: 0.2, targetMs: 6, target: 600000 });
+console.log(`\n   GPU effectively free: walk ${f1(fastGpu.walkMs)} ms, binding ${fastGpu.binding}`);
+check(fastGpu.walkMs < 6.4 && fastGpu.binding === 'time',
+  `the walk's own ceiling still holds (${f1(fastGpu.walkMs)} ms, binding ${fastGpu.binding})`);
+const capped = run({ ...RUNG, target: 120000, gpuRate: 1e9, gpuFixed: 0.2 });
+check(Math.round(capped.splats) <= 120001 && capped.binding === 'splats',
+  `and so does the rung's splat ceiling (${Math.round(capped.splats)} of 120000, binding ${capped.binding})`);
+
+// ------------------------------------------------------- 5. the refresh rate
+// The period is observed, not configured.  A 120 Hz display must get half the
+// frame budget and converge on its own.
+const hz120 = run({ ...RUNG, refresh: 8.333, gpuRate: 30000 });
+console.log('\n5. the refresh period is observed, not configured');
+console.log(`   120 Hz: refresh seen ${hz120.st.refreshMs.toFixed(2)} ms`
+  + `  frame ${f1(hz120.frameMs)} ms  splats ${Math.round(hz120.splats)}`);
+check(Math.abs(hz120.st.refreshMs - 8.333) < 0.2,
+  `the period is recovered from the intervals (${hz120.st.refreshMs.toFixed(2)} ms)`);
+check(hz120.frameMs < 8.333 * FRAME_FILL * 1.12,
+  `and the frame fits inside it (${f1(hz120.frameMs)} ms)`);
+check(hz120.splats < slow.splats * 0.6,
+  `which costs detail against 60 Hz, as it must (${Math.round(hz120.splats)} vs ${Math.round(slow.splats)})`);
+
+// ------------------------------------------------------------- 6. transients
+// A step change in cost: the response is bounded per frame, quicker to give
+// detail up than to take it back, and it must recover rather than ring.
+const st6 = makeBudget({ targetMs: 24, target: 600000, budgetBy: 'both', lodScale: 4.0 });
+let worstStep = 0, recover = -1, violated = 0;
+const settled = [];
+for (let i = 0; i < 400; i++) {
+  // the cliff: at frame 200 the GPU gets six times slower
+  const gpuRate = i < 200 ? 90000 : 15000;
+  const c = Math.min(count(st6.lodScale), 800000);
+  const walkMs = c / 60000, gpuMs = c / gpuRate + 1.5, cpuMs = walkMs + 0.8;
+  const frameMs = cpuMs + gpuMs;
+  const interval = 16.667 * Math.max(1, Math.ceil(frameMs / 16.667));
+  const before = st6.lodScale;
+  budgetStep(st6, { walkMs, count: c, cpuMs, gpuMs, interval, hit: c >= 800000 });
+  const rel = Math.abs(st6.lodScale - before) / before;
+  if (i > 5) worstStep = Math.max(worstStep, rel);
+  if (i >= 200) {
+    // The controller's setpoint IS the budget, so "recovered" means back AT
+    // it within a couple of percent, not under it -- converging exactly onto
+    // 14.2 ms would otherwise count as 200 frames of violation.
+    const over = 16.667 * FRAME_FILL * 1.02;
+    if (frameMs > over) violated++;
+    if (recover < 0 && violated > 0 && frameMs <= over) recover = i - 200;
+    if (i > 340) settled.push(st6.lodScale);
+  }
+}
+const ripple6 = (Math.max(...settled) - Math.min(...settled))
+              / (settled.reduce((a, b) => a + b, 0) / settled.length);
+console.log('\n6. a step change: the GPU gets 6x slower at frame 200');
+console.log(`   worst single-frame threshold move ${(worstStep * 100).toFixed(1)}%`
+  + `  over budget for ${violated} frames  recovered in ${recover}`
+  + `  settled ripple ${(ripple6 * 100).toFixed(2)}%`);
+check(worstStep <= 0.30 + 1e-9,
+  `no frame moves the threshold by more than the 30% bound (${(worstStep * 100).toFixed(1)}%)`);
+check(recover > 0 && recover < 40, `the frame budget is met again within 40 frames (${recover})`);
+check(ripple6 < 0.05, `and it settles rather than ringing (${(ripple6 * 100).toFixed(2)}%)`);
+
+// ------------------------------------------------------------- 7. disjoint
+// EXT_disjoint_timer_query's own failure mode: the GPU was interrupted and
+// every number in flight is rubbish, which GpuClock reports as null.  That
+// must read as "no timer query" -- fall back to the brake -- and never as "the
+// GPU costs nothing", which would hand out detail until the frame rate died.
+const st7 = makeBudget({ targetMs: 24, target: 600000, budgetBy: 'both', lodScale: 4.0 });
+const seen = [];
+for (let i = 0; i < 500; i++) {
+  const c = Math.min(count(st7.lodScale), 800000);
+  const walkMs = c / 60000, gpuMs = c / 15000 + 1.5, cpuMs = walkMs + 0.8;
+  const interval = 16.667 * Math.max(1, Math.ceil((cpuMs + gpuMs) / 16.667));
+  // the query works for 200 frames, then goes disjoint for good
+  budgetStep(st7, { walkMs, count: c, cpuMs, gpuMs: i < 200 ? gpuMs : null,
+                    interval, hit: false });
+  seen.push({ ls: st7.lodScale, interval, binding: st7.binding });
+}
+const withQ = seen[199], after = seen.slice(-120);
+const ivAfter = after.reduce((a, h) => a + h.interval, 0) / after.length;
+const lsAfter = after.reduce((a, h) => a + h.ls, 0) / after.length;
+console.log('\n7. the timer query goes disjoint at frame 200');
+console.log(`   with the query: lodScale ${f1(withQ.ls)}, binding ${withQ.binding}`);
+console.log(`   after it fails: lodScale ${f1(lsAfter)}, interval ${f1(ivAfter)} ms,`
+  + ` binding ${after[after.length - 1].binding}`);
+check(withQ.binding === 'gpu', 'while the query works the GPU term is what binds');
+check(lsAfter > 1.5,
+  `once it fails the brake holds detail back rather than letting it run (${f1(lsAfter)})`);
+check(ivAfter < 16.667 * MISS_AT,
+  `and frames keep landing on time (${f1(ivAfter)} ms, ${f1(1000 / ivAfter)} fps)`);
+check(Math.abs(lsAfter - withQ.ls) / withQ.ls < 0.5,
+  `at a threshold close to what the query had found (${f1(lsAfter)} against ${f1(withQ.ls)})`);
+
+console.log(fail ? `\n  ${fail} FAILED` : '\n  budget ok');
+process.exit(fail ? 1 : 0);
