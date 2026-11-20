@@ -543,43 +543,69 @@ export class Viewer {
     this.resetFlight();
 
     const N = this.stream.max;
-    this.bPos = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bPos);
-    gl.bufferData(gl.ARRAY_BUFFER, N * 12, gl.DYNAMIC_DRAW);
-    this.bCov = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCov);
-    gl.bufferData(gl.ARRAY_BUFFER, N * 24, gl.DYNAMIC_DRAW);
-    this.bCol = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCol);
-    gl.bufferData(gl.ARRAY_BUFFER, N * 4, gl.DYNAMIC_DRAW);
-    this.bFx = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bFx);
-    gl.bufferData(gl.ARRAY_BUFFER, N, gl.DYNAMIC_DRAW);
 
+    // A RING of buffer sets, one VAO each.
+    //
+    // The flight re-uploads every splat every frame, into buffers the GPU may
+    // still be reading from for the frame before: a bufferSubData over live
+    // contents is the textbook cause of an implicit synchronisation, where the
+    // driver either stalls until the draw is done or silently renames the
+    // allocation behind your back.  Which of those it does is a driver
+    // decision and there is no GL here to ask.  So the frame writes into a
+    // slot the GPU has demonstrably finished with instead, and the question
+    // does not arise.
+    //
+    // Three deep, because the timer query already shows results landing one
+    // or two frames late, so that is how far behind the GPU can be.  Depth 1
+    // is exactly the old behaviour and is what `opts.ring: 1` asks for.
+    //
+    // It costs VRAM: 41 bytes a splat times maxSplats times the depth, which
+    // at the 400k default is 16.4 MB a slot and 49 MB for three. The CPU side
+    // already holds one of those 16.4 MB, so this is the same order as what
+    // the engine allocates anyway.
+    this.ringN = Math.max(1, (this.opts.ring ?? 3) | 0);
+    this.ringAt = 0;
     const S = this.S;
-    gl.bindVertexArray(S.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bPos);
-    gl.enableVertexAttribArray(S.a.pos);
-    gl.vertexAttribPointer(S.a.pos, 3, gl.FLOAT, false, 12, 0);
-    gl.vertexAttribDivisor(S.a.pos, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCov);
-    gl.enableVertexAttribArray(S.a.covA);
-    gl.vertexAttribPointer(S.a.covA, 3, gl.FLOAT, false, 24, 0);
-    gl.vertexAttribDivisor(S.a.covA, 1);
-    gl.enableVertexAttribArray(S.a.covB);
-    gl.vertexAttribPointer(S.a.covB, 3, gl.FLOAT, false, 24, 12);
-    gl.vertexAttribDivisor(S.a.covB, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCol);
-    gl.enableVertexAttribArray(S.a.color);
-    gl.vertexAttribPointer(S.a.color, 4, gl.UNSIGNED_BYTE, true, 4, 0);
-    gl.vertexAttribDivisor(S.a.color, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bFx);
-    gl.enableVertexAttribArray(S.a.fx);
-    // NOT normalised: the shader wants the byte's value as a bit field, and
-    // normalising would hand it 1/255ths to round back.
-    gl.vertexAttribPointer(S.a.fx, 1, gl.UNSIGNED_BYTE, false, 1, 0);
-    gl.vertexAttribDivisor(S.a.fx, 1);
-    gl.bindVertexArray(null);
+    for (const sl of this.ring || [])
+      { for (const b of sl.b) gl.deleteBuffer(b); gl.deleteVertexArray(sl.vao); }
+    this.ring = [];
+    for (let i = 0; i < this.ringN; i++) {
+      const mk = (bytes) => {
+        const b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, bytes, gl.DYNAMIC_DRAW);
+        return b;
+      };
+      const bPos = mk(N * 12), bCov = mk(N * 24), bCol = mk(N * 4), bFx = mk(N);
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+      gl.enableVertexAttribArray(S.a.corner);
+      gl.vertexAttribPointer(S.a.corner, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bPos);
+      gl.enableVertexAttribArray(S.a.pos);
+      gl.vertexAttribPointer(S.a.pos, 3, gl.FLOAT, false, 12, 0);
+      gl.vertexAttribDivisor(S.a.pos, 1);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bCov);
+      gl.enableVertexAttribArray(S.a.covA);
+      gl.vertexAttribPointer(S.a.covA, 3, gl.FLOAT, false, 24, 0);
+      gl.vertexAttribDivisor(S.a.covA, 1);
+      gl.enableVertexAttribArray(S.a.covB);
+      gl.vertexAttribPointer(S.a.covB, 3, gl.FLOAT, false, 24, 12);
+      gl.vertexAttribDivisor(S.a.covB, 1);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bCol);
+      gl.enableVertexAttribArray(S.a.color);
+      gl.vertexAttribPointer(S.a.color, 4, gl.UNSIGNED_BYTE, true, 4, 0);
+      gl.vertexAttribDivisor(S.a.color, 1);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bFx);
+      gl.enableVertexAttribArray(S.a.fx);
+      // NOT normalised: the shader wants the byte's value as a bit field, and
+      // normalising would hand it 1/255ths to round back.
+      gl.vertexAttribPointer(S.a.fx, 1, gl.UNSIGNED_BYTE, false, 1, 0);
+      gl.vertexAttribDivisor(S.a.fx, 1);
+      gl.bindVertexArray(null);
+      this.ring.push({ vao, b: [bPos, bCov, bCol, bFx] });
+    }
   }
 
   // The two morph switches the panel drives. Accessors rather than fields,
@@ -1001,20 +1027,24 @@ export class Viewer {
     if (!n) return;
 
     const o = st.offset;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bPos);
+    this.ringAt = (this.ringAt + 1) % this.ringN;
+    const slot = this.ring[this.ringAt];
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[0]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.pos, 3 * o, 3 * n);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCov);
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[1]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.cov, 6 * o, 6 * n);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCol);
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[2]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.rgba, 4 * o, 4 * n);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bFx);
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[3]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.fx, o, n);
+    this.stats.upload = n * 41;
 
     const G = this.S;
     gl.useProgram(G.p);
-    gl.bindVertexArray(G.vao);
+    gl.bindVertexArray(slot.vao);
     this.setCommonUniforms(G, { eye: cam.pos, r: cam.r, u: cam.u, f: cam.f }, W, H, f);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+    gl.bindVertexArray(null);
   }
 
   start() {

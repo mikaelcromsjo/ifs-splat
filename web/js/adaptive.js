@@ -1361,9 +1361,29 @@ export class AdaptiveStream {
   constructor(att, maxSplats = 400000) {
     this.att = att;
     this.max = maxSplats;
-    this.pos = new Float32Array(3 * maxSplats);
-    this.cov = new Float32Array(6 * maxSplats);
-    this.rgba = new Uint8Array(4 * maxSplats);
+    // One allocation, four views into it, at the same indices they always
+    // had: pos[3*i], cov[6*i], rgba[4*i], fx[i].  Nothing that reads them
+    // changes, and that is the point -- cpu_raster.js and the parity tests
+    // index these arrays directly and compare them bit for bit.
+    //
+    // NOT interleaved per splat, which was the first idea and is a
+    // pessimisation here.  The GPU reads these as four instanced streams with
+    // divisor 1, so consecutive instances read consecutive addresses within
+    // each stream: a 64-byte line from pos serves 5.3 instances, from cov
+    // 2.7, and the whole set costs 41/64 = 0.64 lines an instance.  One
+    // 44-byte interleaved record -- 41 bytes padded to a 4-byte stride for
+    // the float views -- costs 0.69.  Structure-of-arrays is the right layout
+    // for a full sequential sweep, and that is the only access pattern there
+    // is here.
+    //
+    // What one allocation does buy: the whole frame's splats are one
+    // ArrayBuffer, so a worker can hand it over with a single transfer
+    // instead of four, and a ring slot is one object rather than four.
+    const STRIDE = 3 * 4 + 6 * 4 + 4 + 1;        // 41 bytes a splat
+    this.bytes = new ArrayBuffer(STRIDE * maxSplats);
+    this.pos = new Float32Array(this.bytes, 0, 3 * maxSplats);
+    this.cov = new Float32Array(this.bytes, 12 * maxSplats, 6 * maxSplats);
+    this.rgba = new Uint8Array(this.bytes, 36 * maxSplats, 4 * maxSplats);
     // Which look-effects each splat's OBJECT permits, one byte per splat.
     //
     // A separate array rather than bits stolen from rgba's alpha. Alpha is
@@ -1373,7 +1393,7 @@ export class AdaptiveStream {
     // reference bit for bit. Adding a field beside them cannot disturb that;
     // repacking one of them would have put a cosmetic feature in a position
     // to break the generator's correctness proof.
-    this.fx = new Uint8Array(maxSplats);
+    this.fx = new Uint8Array(this.bytes, 40 * maxSplats, maxSplats);
     this.curFx = 0xff;   // what the object being expanded right now allows
     // A stable identity per splat, so a test can tell "this blob faded" from
     // "this blob vanished".  Not uploaded; the renderer never needs it.
