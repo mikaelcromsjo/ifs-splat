@@ -27,7 +27,7 @@ and draw order (`py/parity_check.py`); the GLSL math matches the Python referenc
 - Re-rooted float32 positions **exact**; world-coordinate float32 carries 3.9% of a splat radius of
   error at that depth.
 - Cross-fade band gives **~30× fewer visible pops** than a hard cut (`web/tests/pop.mjs`).
-- **LOD fidelity measured against ground truth** (`web/tests/fidelity.mjs`): 26–44 dB at 2–12×
+- **LOD fidelity measured against ground truth** (`web/tests/fidelity.mjs`): 25.1–36.4 dB at 2.2–15.0×
   fewer splats. Sparse sharp structures (lattice, plane, spine) sit at ~26 dB — a Gaussian cannot
   represent a sharp-edged void. Dense ones reach 35–44 dB.
 - Blob opacity 0.95 was checked against ground truth rather than guessed: a sweep showed PSNR rises

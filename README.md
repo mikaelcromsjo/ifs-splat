@@ -47,14 +47,19 @@ trunk mass fraction, a Sierpinski tetrahedron is four maps with that fraction at
 - **Zooms without bottom.** The camera re-roots into whichever node it is inside, so depth is
   unbounded: **depth 52, eleven orders of magnitude**, with a round trip through world
   coordinates exact to one float64 ulp.
-- **Adapts its level of detail** to a splat budget and cross-fades what it drops — 26–44 dB
-  against a fully expanded ground truth at 2–12× fewer splats.
+- **Adapts its level of detail** to a splat budget and cross-fades what it drops — 25–36 dB
+  against a fully expanded ground truth at 2–15× fewer splats.
 - **Fills an endless field.** Attractors are placed by hashing where you are, in a hierarchy whose
   cells are provably disjoint: 1.5M pair tests across a 240 s flight, zero intersections, while
   everything drifts, breathes and turns.
 - **Morphs while you fly**, along a closed C¹ spline through the map sets, at **the display's
   frame rate** rather than the rebuild rate — the shape between two rebuilds is a lerp done *as
   the traversal reads the table*, which costs +3.8% on the frame.
+- **Spends what it saves.** The level of detail is held by a controller that measures the whole
+  frame — the walk's own time, the splat ceiling, and the GPU's, from a timer query — so a cheaper
+  draw turns into more structure instead of an emptier frame. Doubling draw throughput buys 1.50×
+  the splats; the walk itself splits over four threads at 2.15×, splat-for-splat identical to the
+  serial walk.
 - **Flies itself** — a slow autopilot that dives along the attractor's boundary rather than into
   its mass, banks into its turns and climbs back out, under a nebula whose stars are band-limited
   the same way the splats are, so nothing crawls when the scale changes by factors of ten.
@@ -79,6 +84,15 @@ no WebGL run, no screenshot from a real device, no measured frame time. The shad
 transcribing them to the CPU and comparing against the Python reference, which pins the arithmetic
 and says nothing about whether they compile. The compute kernel reproduces the CPU expansion with
 **0 wrong draw slots out of 114,687** — a statement about arithmetic, not about drivers.
+
+The throughput work adds to that list rather than shrinking it: `EXT_disjoint_timer_query_webgl2`,
+the half-resolution sky's framebuffer and its upsample program, and the ring of upload buffers are
+all going out to real drivers unexercised. Each one fails soft — a missing timer query falls back
+to a brake on missed frames, a framebuffer that will not complete draws the sky at full
+resolution, and `opts.ring: 1` is the old upload path — because the alternative is a black page.
+What *is* executed here is everything that can be: the detail controller on synthetic load, both
+forms of the projection compared at the last bits, and the threaded walk on real
+`worker_threads`.
 
 Everything else in [MEASURED.md](MEASURED.md) was measured headlessly, with a CPU rasteriser that
 is a line-by-line twin of the shader.
@@ -136,6 +150,10 @@ node tests/gpu_transcribe.mjs 7        # the compute kernel against the CPU expa
 node tests/reroot.mjs                  # unbounded zoom, and the round trip through world space
 node tests/pilot.mjs                   # what the dive aims at, and what banking does
 node tests/space.mjs                   # the sky, and whether its stars crawl
+node tests/budget.mjs                  # the detail controller, on synthetic load
+node tests/project.mjs                 # the two forms of the shader's projection
+node tests/shard.mjs 4                 # the walk split over four real threads,
+                                       # compared to the serial walk splat for splat
 ```
 
 The flight is chaotic by construction — perturb the camera speed by one part in a million and the
