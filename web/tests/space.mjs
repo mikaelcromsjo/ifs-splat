@@ -83,6 +83,63 @@ function skyOnly(B, look, px) {
   return { img, W, H };
 }
 
+/**
+ * The sky as the viewer now draws it: rendered at a fraction of the viewport
+ * and stretched back bilinearly (viewer.js nebTarget/BLIT_FRAG).
+ *
+ * The star floor comes from the REDUCED target, not the screen, because
+ * uStarPx is handed the height the sky is actually drawn at -- so a half-res
+ * star is floored at one half-res pixel and comes out twice as wide in angle.
+ * That is the one visible cost of the optimisation, and the question this
+ * measures is whether the field is still band-limited afterwards, which is
+ * the whole reason the floor exists.
+ *
+ * GL_LINEAR on a CLAMP_TO_EDGE RGBA8 texture, drawn over a full-screen quad:
+ * sample centres land at (x+0.5)/W in texture coordinates, so the source
+ * coordinate is (x+0.5)*sw/W - 0.5, clamped at the edges.
+ */
+function skyScaled(B, look, scale) {
+  const sw = Math.max(1, Math.round(W * scale)), sh = Math.max(1, Math.round(H * scale));
+  const spx = (2 * tanY) / sh;            // one pixel OF THE REDUCED TARGET
+  const src = new Uint8Array(sw * sh * 3);
+  for (let y = 0; y < sh; y++) {
+    const ny = 1 - (2 * (y + 0.5)) / sh;
+    for (let x = 0; x < sw; x++) {
+      const nx = (2 * (x + 0.5)) / sw - 1;
+      const vx = nx * tanX, vy = ny * tanY;
+      let d = [B.r[0] * vx + B.u[0] * vy + B.f[0],
+               B.r[1] * vx + B.u[1] * vy + B.f[1],
+               B.r[2] * vx + B.u[2] * vy + B.f[2]];
+      const l = Math.hypot(d[0], d[1], d[2]);
+      d = [d[0] / l, d[1] / l, d[2] / l];
+      const c = skyColour(d, look, spx);
+      const o = 3 * (y * sw + x);
+      for (let k = 0; k < 3; k++)
+        src[o + k] = Math.round(255 * Math.min(Math.max(c[k], 0), 1) ** (1 / 1.1));
+    }
+  }
+  const img = new Uint8Array(W * H * 3);
+  const cl = (v, n) => Math.min(Math.max(v, 0), n - 1);
+  for (let y = 0; y < H; y++) {
+    const fy = ((y + 0.5) * sh) / H - 0.5;
+    const y0 = Math.floor(fy), wy = fy - y0;
+    const ya = cl(y0, sh), yb = cl(y0 + 1, sh);
+    for (let x = 0; x < W; x++) {
+      const fx = ((x + 0.5) * sw) / W - 0.5;
+      const x0 = Math.floor(fx), wx = fx - x0;
+      const xa = cl(x0, sw), xb = cl(x0 + 1, sw);
+      const o = 3 * (y * W + x);
+      for (let k = 0; k < 3; k++) {
+        const p00 = src[3 * (ya * sw + xa) + k], p10 = src[3 * (ya * sw + xb) + k];
+        const p01 = src[3 * (yb * sw + xa) + k], p11 = src[3 * (yb * sw + xb) + k];
+        img[o + k] = (p00 * (1 - wx) * (1 - wy) + p10 * wx * (1 - wy)
+                    + p01 * (1 - wx) * wy + p11 * wx * wy + 0.5) | 0;
+      }
+    }
+  }
+  return { img, W, H };
+}
+
 /** Rotate a basis about its own up axis. */
 const turned = (B, a) => {
   const c = Math.cos(a), s = Math.sin(a);
@@ -110,6 +167,17 @@ for (const [label, px] of [['floored', PX], ['spike', 0]]) {
   console.log(`  ${label.padEnd(8)}` + runs[label].map((d, i) =>
     `  ${QS[i]}px: mean ${d.mean.toFixed(3)} worst ${String(d.worst).padStart(3)}`).join(''));
 }
+// The same measurement on the sky as it now ships: drawn at half the
+// viewport and stretched.  A quarter of the fragments, and the question is
+// whether the field that comes out is still band-limited -- the stretch is a
+// linear resample, which cannot ADD a frequency, but the star floor it is
+// drawn under is twice as wide, which changes the picture.
+{
+  const base = skyScaled(B0, LOOK, 0.5);
+  runs['half-res'] = QS.map((q) => change(base, skyScaled(turned(B0, q * PX), LOOK, 0.5)));
+  console.log(`  ${'half-res'.padEnd(8)}` + runs['half-res'].map((d, i) =>
+    `  ${QS[i]}px: mean ${d.mean.toFixed(3)} worst ${String(d.worst).padStart(3)}`).join(''));
+}
 const grow = (r) => r[2].mean / r[0].mean;        // 1 px against 1/4 px
 const sat = (r) => r[0].worst / r[3].worst;       // 1/4 px against 2 px
 console.log('');
@@ -127,6 +195,37 @@ ok(sat(runs.spike) > 0.7,
 ok(sat(runs.floored) < 0.4,
    'and the floored one is not',
    `worst pixel ${runs.floored[0].worst} at 1/4 px, ${runs.floored[3].worst} at 2 px`);
+
+// The half-resolution sky, on the same terms.  This is what justifies drawing
+// the most expensive pass in the engine at a quarter of the fragments: it is
+// allowed to look slightly different, it is not allowed to crawl.
+const g = grow(runs['half-res']);
+ok(g > 3.0 && g < 4.8,
+   'the half-res sky answers motion in proportion to it too',
+   `${g.toFixed(2)}x for a 4x turn`);
+ok(sat(runs['half-res']) < 0.4,
+   'and is no nearer saturation than the full-resolution one',
+   `worst pixel ${runs['half-res'][0].worst} at 1/4 px, `
+   + `${runs['half-res'][3].worst} at 2 px`);
+// What it DOES cost, stated rather than hidden: the stars are twice as wide,
+// so the picture is not the same picture.  Measured against the full-res sky
+// at the same instant, with and without stars, so the number is the stars'
+// own contribution and not the lobes'.
+{
+  const full = skyOnly(B0, LOOK, PX), half = skyScaled(B0, LOOK, 0.5);
+  const fullNo = skyOnly(B0, { ...LOOK, starAmt: 0 }, PX);
+  const halfNo = skyScaled(B0, { ...LOOK, starAmt: 0 }, 0.5);
+  const lobes = change(fullNo, halfNo), all = change(full, half);
+  console.log(`\n  half-res against full-res: the lobes and band differ by`
+    + ` ${lobes.mean.toFixed(3)}/255 mean (worst ${lobes.worst}),`
+    + ` the whole sky by ${all.mean.toFixed(3)}/255 (worst ${all.worst})`);
+  ok(lobes.mean < 0.35,
+     'the lobes and band survive the stretch -- they were band-limited already',
+     `mean |d| ${lobes.mean.toFixed(3)}/255`);
+  ok(all.mean > lobes.mean,
+     'and the difference that is left is the stars, which are twice as wide',
+     `${all.mean.toFixed(3)} against ${lobes.mean.toFixed(3)}/255`);
+}
 
 // Stars have to be THERE, not just steady: a field of nothing is perfectly
 // steady too.

@@ -140,6 +140,7 @@
   <label><input type="checkbox" id="fxRim" checked> rim light</label>
   <label><input type="checkbox" id="fxNeb" checked> nebula</label>
   <label><input type="checkbox" id="fxStar" checked> stars</label>
+  <label><input type="checkbox" id="fxSkyHalf" checked> half-res sky</label>
   <div class="hint" id="fxHint">&nbsp;</div>
   <hr>
   <h2>morph</h2>
@@ -210,7 +211,7 @@ try {
   // box here turns the effect off everywhere no matter what any object asked
   // for.  Ticking it back does not turn it on everywhere -- objects that did
   // not opt in stay plain, which is the point of having the mix.
-  const fxBoxes = ['fxIrid', 'fxRim', 'fxNeb', 'fxStar'];
+  const fxBoxes = ['fxIrid', 'fxRim', 'fxNeb', 'fxStar', 'fxSkyHalf'];
   // The star field's switch is its brightness, not a flag: the shader skips
   // the whole nine-cell loop when it is zero, so off costs nothing.
   const STARS = v.look.starAmt;
@@ -218,9 +219,19 @@ try {
     v.look.mask = ($('fxIrid').checked ? 1 : 0) | ($('fxRim').checked ? 2 : 0);
     v.look.nebula = $('fxNeb').checked;
     v.look.starAmt = $('fxStar').checked ? STARS : 0;
+    // The sky is the most expensive fragment work in the engine -- four
+    // exponentials and a nine-tap star hash per pixel -- and the least
+    // detailed thing in the picture, so it is drawn at half resolution and
+    // stretched. Unticking this draws it at full resolution, which is what it
+    // used to do: the lobes are identical either way because they are
+    // band-limited by construction, and the stars come out half the width,
+    // because a star's floor is one pixel of whatever it is drawn into.
+    v.look.nebScale = $('fxSkyHalf').checked ? 0.5 : 1;
     const on = fxBoxes.filter((id) => $(id).checked).length;
-    $('fxHint').textContent = on === 0
-      ? 'all off — plain palette colour'
+    $('fxHint').textContent = !$('fxNeb').checked
+      ? 'no sky — the flat clear colour, as it was before the nebula'
+      : $('fxSkyHalf').checked
+      ? 'the sky is drawn at half resolution: a quarter of its fragments'
       : 'objects opt in individually; these switch off what they asked for';
   };
   for (const id of fxBoxes) $(id).addEventListener('change', syncFx);
