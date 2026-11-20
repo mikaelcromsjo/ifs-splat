@@ -83,6 +83,8 @@
     <tr id="rOrd"><td class="k">order</td><td id="ord">—</td></tr>
     <tr id="rEx"><td class="k">exact sort</td><td id="ex">—</td></tr>
     <tr id="rExp"><td class="k">expand</td><td id="exp">—</td></tr>
+    <tr id="rGpu"><td class="k">gpu</td><td id="gpu">—</td></tr>
+    <tr id="rBind"><td class="k">detail held by</td><td id="bind">—</td></tr>
     <tr id="rDep"><td class="k">depth</td><td id="dep">—</td></tr>
     <tr id="rSc"><td class="k">zoom</td><td id="sc">—</td></tr>
     <tr id="rHere"><td class="k">inside</td><td id="here">—</td></tr>
@@ -376,6 +378,7 @@ try {
     show($('rOrd'), !fly);
     show($('rEx'), !fly);
     show($('rExp'), fly);
+    show($('rBind'), fly);
     show($('rDep'), fly);
     show($('rSc'), fly);
     show($('rHere'), fly);
@@ -403,6 +406,17 @@ try {
     $('ord').textContent = v.stats.order ? ms(v.stats.order) : '—';
     $('ex').textContent = v.stats.exact ? ms(v.stats.exact) : '—';
     $('exp').textContent = v.stats.expand ? ms(v.stats.expand) : '—';
+    // The GPU's own time, from EXT_disjoint_timer_query_webgl2, a frame or two
+    // stale. A dash means the extension is not there -- a zero would read as
+    // "the GPU costs nothing", which is the thing the detail controller used
+    // to believe. `detail held by` is which term of that controller is
+    // binding: the walk's clock, the rung's splat ceiling, the measured frame,
+    // or the brake on missed frames when there is no timer query to ask.
+    $('gpu').textContent = v.stats.gpu == null ? '—' : ms(v.stats.gpu);
+    $('bind').textContent = ({
+      gpu: 'the frame', interval: 'missed frames', time: 'the walk clock',
+      splats: 'the splat ceiling', frozen: 'nothing (frozen)',
+    })[v.stats.binding] || '—';
     $('dep').textContent = v.stats.depth;
     $('here').textContent = v.stats.here || '—';
     $('mor').textContent = v.stats.morph ? ms(v.stats.morph) : 'held';

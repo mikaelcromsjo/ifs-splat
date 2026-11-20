@@ -472,3 +472,79 @@ discards the optimised code for every method that reads its properties. The expe
 `reparam`, 50 property reads and a 36,864-iteration loop. Nothing about this is visible in the
 source, and the only reason it was found is that `tests/field.mjs` asserts a bound on the first four
 frames in milliseconds rather than as a ratio to the median.
+
+## Six throughput ideas, and the two that did not survive their own arithmetic
+
+Written while optimising the engine for throughput rather than for anything visible, which is a
+mode with a particular failure: an optimisation is easy to *build* and hard to show is worth
+having, and a plausible one is not the same as a real one. Four of the six were built. Two were
+costed first and should not be, and the costing is here because the next person to have the same
+idea deserves the number rather than the idea.
+
+**The thing that made the other five worth anything: the detail controller could not see the GPU.**
+`AdaptiveStream.end()` held its budget against the walk's own time and splat count, both measured
+on the CPU inside the expansion. So every saving on the far side of the fence produced nothing
+visible at all — the walk still spent its 6 ms, emitted the same splats, and the frame finished
+early with the slack discarded. Any list of GPU optimisations starts with closing that loop or it
+is a list of things nobody will see. It is the one item here that was not an optimisation at all;
+it is what made the rest into optimisations.
+
+**Replacing a splat's quad with a triangle fan, to emulate the Gaussian with transparent edges.**
+The idea is to save fragments by hugging the ellipse more tightly than a quad does, and to
+replace the per-fragment `exp` with interpolated vertex alpha. The minimum-area circumscribed
+regular N-gon has area `N·tan(π/N)`: a quad is 4.000, a hexagon 3.464, an octagon 3.314, the
+ellipse itself π. So **21.5% of the discarded fragments is the entire ceiling** on any polygon
+tightening, a hexagon reaches 13.4% of it for 1.5x the vertex-shader invocations, and at the
+small end rasterisation is 2x2-quad granular, so a three-triangle hull across a four-pixel splat
+spawns more partially-covered quads than a two-triangle one and the saving inverts. Against that:
+the skirt is 27% of a `uCut = 3.0` quad and every wasted fragment is `discard`, no blend and no
+write, while MEASURED.md puts the canopy at only ~2x overdrawn. It is 13% of something that is
+not the bottleneck.
+
+The transparent-edge half is worse than useless: iso-alpha contours become N-gons, which is the
+exact artefact the 2048-pixel quad cap used to produce and which `shaders.js` carries a long
+comment about fixing; the centre vertex is a cone apex, so overlapping splats sum to creases
+where Gaussians sum smooth; and `uKappa`, `uLowpass` and `comp = sqrt(det0/det1)` all exist
+because convolving a Gaussian with a pixel-sized Gaussian is a Gaussian in closed form, which a
+tent is not. The anti-aliasing stops being principled, and the file's first comment says that
+without it every later judgement is made against a broken image.
+
+**A transform-feedback pass, so the per-splat setup runs once instead of four times.** All four
+corners of every quad compute the same projection, the same two determinants, the same
+eigen-decomposition, the same three cosines and the same `pow`. Running that once per splat into a
+captured buffer and reducing the vertex shader to `p = centre + corner.x*maj + corner.y*mnr` is a
+4x cut in that work, and it is real: the restructuring in `shaders.js` only got a fifth off the
+expression because the redundancy, not the expression, is where the factor is.
+
+It is still not worth it, and the arithmetic says so before any code is written. Per splat the
+vertex shader does roughly 160 ALU operations and about 20 special-function operations — two
+square roots, a reciprocal square root, two divides, three cosines, a `pow` — which at the usual
+quarter rate is some 300 fused-multiply-adds of work, four times over. At 300k splats and 60 Hz
+that is **5.4 GFMA/s, which is 0.27% of a 4 TFLOP desktop GPU and 2.2% of a 500 GFLOP integrated
+one.** The pass would buy three quarters of that. Against it: the captured record is
+centre, the quad's own origin, two basis vectors, the conic and the colour — 15 floats, 60 bytes a
+splat, so 24 MB of VRAM at the 400k cap and about 31 MB a frame written and read straight back,
+1.9 GB/s of bandwidth bought to save a fifth of a percent of arithmetic. The vertex shader is not
+where the time goes. The fill and the blend and the walk are.
+
+**fp16 covariance, to cut the upload.** The covariance is 24 of the 41 bytes a splat and halving
+it takes the vertex fetch from 0.64 cache lines an instance to 0.45, which is a real 29%. But the
+upload it shrinks is 8.2 MB a frame at 200k splats, 490 MB/s, which is 3-6% of PCIe — and the
+conversion has to happen somewhere. JS has no f32-to-f16 primitive before `Float16Array`, which is
+not in the Node this is tested on and not old enough to rely on in a browser, so the fallback is a
+manual bit-twiddle over 6n values a frame: 1.8M conversions, several milliseconds, **added to the
+walk, which is the one resource the whole engine is budgeted around.** Paying the bottleneck to
+relieve something that is not one.
+
+**Interleaving the four instance streams into one record.** Costed and dropped in the same hour it
+was proposed: see the commit. Structure-of-arrays is already the right layout for a sequential
+instanced sweep, and the padding needed to keep the float views aligned costs more than the
+grouping saves — 0.688 cache lines an instance against 0.641.
+
+**What was worth it.** The frame-time controller, because nothing else is visible without it. The
+upload ring, because an implicit synchronisation is a stall whose existence depends on a driver
+heuristic nobody here can interrogate. The sky at half resolution, because it is four exponentials
+and a nine-tap star hash per pixel for the least detailed thing on the screen, and it was built
+band-limited on purpose so a bilinear stretch cannot add anything back. And the threaded walk,
+because the walk is the budgeted resource and therefore the only place where a saving converts
+directly into detail — 2.15x on four threads, splat for splat identical to the serial walk.
