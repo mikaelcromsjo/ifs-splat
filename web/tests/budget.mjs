@@ -204,7 +204,14 @@ console.log(`   worst single-frame threshold move ${(worstStep * 100).toFixed(1)
   + `  settled ripple ${(ripple6 * 100).toFixed(2)}%`);
 check(worstStep <= 0.30 + 1e-9,
   `no frame moves the threshold by more than the 30% bound (${(worstStep * 100).toFixed(1)}%)`);
-check(recover > 0 && recover < 40, `the frame budget is met again within 40 frames (${recover})`);
+// 45, not the 40 this once asserted: the frame term no longer divides the
+// whole frame by the budget, it fits what a splat costs and holds the rest
+// aside (see scenario 8), and a fit has to be relearned after a step this
+// size.  FIT_A buys the difference back directly -- the figures are in
+// budget.js -- and 45 frames is 0.75 s at 60 Hz for a GPU that got six times
+// slower between one frame and the next.
+check(recover > 0 && recover <= 45,
+  `the frame budget is met again within 45 frames (${recover})`);
 check(ripple6 < 0.05, `and it settles rather than ringing (${(ripple6 * 100).toFixed(2)}%)`);
 
 // ------------------------------------------------------------- 7. disjoint
@@ -237,6 +244,71 @@ check(ivAfter < 16.667 * MISS_AT,
   `and frames keep landing on time (${f1(ivAfter)} ms, ${f1(1000 / ivAfter)} fps)`);
 check(Math.abs(lsAfter - withQ.ls) / withQ.ls < 0.5,
   `at a threshold close to what the query had found (${f1(lsAfter)} against ${f1(withQ.ls)})`);
+
+// ---------------------------------------------------------------------------
+// 8. A FRAME IS NOT ALL SPLATS.
+//
+// Every scenario above models the frame as a function of the splat count --
+// which is the assumption the first version of the frame term was built on,
+// and it is false.  The sky, the pool rebuild, the uniforms and the present
+// cost the same whether there are 300k splats or one.  That version divided
+// the WHOLE frame by the budget, so when the floor alone exceeded the budget
+// no number of splats could satisfy it: the controller pushed the threshold
+// to its clamp and the remembered cliff pinned it there.  One splat, 900 px
+// across, and a detail key that could not win because the loop rewrote the
+// threshold every frame.  It shipped, and a live machine showed it within the
+// hour -- so this scenario has a known floor AND a known marginal cost, and
+// checks the controller recovers both rather than checking it against itself.
+function frameSplit(floorMs, usPerSplat, frames = 2400) {
+  const st = makeBudget({ lodScale: 4.0 });
+  st.targetMs = 6.0; st.target = 2000000; st.budgetBy = 'time'; st.useFrame = true;
+  const cpu = 2.5;
+  let last = {};
+  for (let i = 0; i < frames; i++) {
+    const c = Math.min(2000000, Math.round(900000 / (st.lodScale ** 2)));
+    const gpuMs = (floorMs - cpu) + (c * usPerSplat) / 1000;
+    budgetStep(st, { walkMs: Math.min(6, c / 200000), count: c, cpuMs: cpu,
+                     gpuMs, interval: null, hit: c >= 2000000 });
+    last = { count: c, frame: cpu + gpuMs };
+  }
+  return { st, ...last };
+}
+console.log('\n8. a frame is not all splats: a known floor, and a known cost each');
+console.log('   floor   splats     frame    floor fit   us/splat (true 0.030)  binding');
+const sp = {};
+for (const fl of [5, 10, 15, 20]) {
+  const r = sp[fl] = frameSplit(fl, 0.03);
+  console.log(`   ${String(fl).padStart(2)} ms ${String(r.count).padStart(9)}`
+    + ` ${f1(r.frame).padStart(8)} ms ${f1(r.st.floorMs).padStart(8)}`
+    + `   ${(r.st.fitK * 1000).toFixed(3).padStart(14)}      ${r.st.binding}`);
+}
+const half = frameSplit(5, 0.015);
+check(sp[5].count > 100000,
+  `a low floor leaves most of the budget to splats (${sp[5].count})`);
+check(sp[10].count < sp[5].count,
+  `a higher floor costs detail (${sp[10].count} against ${sp[5].count})`);
+check(sp[15].count > 20000 && sp[20].count > 20000,
+  `a floor OVER the whole budget still leaves a scene (${sp[15].count}, ${sp[20].count})`);
+check(sp[15].st.lodScale < 16 && sp[20].st.lodScale < 16,
+  `at a threshold that is still a fractal, not one splat `
+  + `(${f1(0.9 * sp[15].st.lodScale)} px, ${f1(0.9 * sp[20].st.lodScale)} px)`);
+check(half.count > 1.8 * sp[5].count,
+  `halving the cost of a splat buys ${(half.count / sp[5].count).toFixed(2)}x the splats`);
+// The floor is tested where it is USED.  At 5 and 10 ms it is a control
+// input -- it sets how much of the budget the splats may have -- so it has to
+// be close.  At 15 and 20 it has already decided the term stands down, the
+// count is pinned by the walk clock and no longer identifies the slope, so
+// the number is a diagnostic and all that matters is that it still says
+// "there is no headroom".
+for (const fl of [5, 10])
+  check(Math.abs(sp[fl].st.floorMs - fl) < 1.5,
+    `the fitted floor finds ${fl} ms, which is a control input (${f1(sp[fl].st.floorMs)})`);
+for (const fl of [15, 20])
+  check(Math.abs(sp[fl].st.floorMs - fl) < 3.5,
+    `and ${fl} ms well enough to know there is no headroom (${f1(sp[fl].st.floorMs)})`);
+check(sp[15].binding === 'floor' || sp[15].st.binding === 'time',
+  'and when the floor owns the budget the frame term stands down rather than '
+  + 'punishing the splats for it');
 
 console.log(fail ? `\n  ${fail} FAILED` : '\n  budget ok');
 process.exit(fail ? 1 : 0);

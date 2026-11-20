@@ -81,6 +81,32 @@ export const CLIFF_LEAK = 0.997;
  *  a threshold that does not visibly pulse the rest of the time. */
 export const BRAKE_RISE = 1.06;
 
+/** The leak on the frame fit, and a direct trade against how fast the
+ *  controller answers a step change in what a splat costs.  Measured on a 6x
+ *  GPU slowdown at frame 200 (tests/budget.mjs scenario 6), frames to get back
+ *  inside the budget: 1/300 -> 106, 1/200 -> 75, 1/120 -> 40, 1/80 -> 19.  The
+ *  fitted floor moves the other way, and only in the regime where the term has
+ *  already stood down.  1/120 is two seconds at 60 Hz. */
+export const FIT_A = 1 / 120;
+
+/** Frames before the fit is believed at all. */
+export const FIT_N = 90;
+
+/** The least relative spread in the splat count (sd/mean) that identifies the
+ *  slope.  Below this the count has barely moved and the fit is noise. */
+export const SPAN_MIN = 0.02;
+
+/** The least of the budget that must be the splats' before the frame term is
+ *  believed, in ms.  Below this the frame is almost all floor and the ratio is
+ *  noise. */
+export const MIN_HEAD = 1.5;
+
+/** The most the controller may ever coarsen the threshold.  0.9 x 64 = 58 px
+ *  is a coarse scene but still a recognisable one; the old clamp of 1000 was
+ *  900 px, which is a single splat and no scene at all.  A bound here is what
+ *  makes the worst case survivable rather than blank. */
+export const LS_MAX = 64;
+
 /** Bounds on the observed refresh period, in ms.  Outside these the number is
  *  not a refresh period -- it is a stall, or a clock with no vsync at all. */
 export const REFRESH_LO = 5.0, REFRESH_HI = 40.0;
@@ -100,6 +126,8 @@ export function makeBudget(opts = {}) {
     lodScale: opts.lodScale ?? 4.0,
     // observed, never configured
     refreshMs: 0,
+    floorMs: 0,
+    fitMx: 0, fitMy: 0, fitCxx: 0, fitCxy: 0, fitN: 0, fitK: 0,
     emaFrame: 0,
     emaAlpha: opts.emaAlpha ?? 0.12,
     // The cliff the brake remembers.  Only ever used on the fallback path:
@@ -154,8 +182,67 @@ export function budgetStep(st, m) {
       // Two-sided: this is the term that converts a cheaper draw into detail.
       st.frameMs = (m.cpuMs ?? 0) + m.gpuMs;
       st.gpuMs = m.gpuMs;
-      errF = st.frameMs / budget;
-      how = 'gpu';
+      // ...but only against the part of the frame the detail can actually
+      // move.  THE FIRST VERSION OF THIS DIVIDED THE WHOLE FRAME BY THE
+      // BUDGET, and that is wrong in a way that destroys the scene: the sky,
+      // the pool rebuild, the uniforms and the present cost the same whether
+      // there are 300k splats or one, so when that floor alone exceeds the
+      // budget there is no number of splats that satisfies the term.  The
+      // controller then pushes the threshold to its clamp and the remembered
+      // cliff pins it there: one splat, 900 px across, and a detail key that
+      // cannot win because the loop rewrites the threshold every frame.  It
+      // shipped, and it is what a live machine showed within the hour.
+      //
+      // So the frame is SEPARATED into the part that follows the splat count
+      // and the part that does not, by fitting
+      //
+      //     frameMs  ~  floor + k * count
+      //
+      // over a leaky window.  Taking the least frame ever seen as the floor
+      // was the obvious cheap answer and it does not work: the minimum is
+      // whatever the detail happened to cost when the page opened, not the
+      // floor, so the headroom collapses to nothing and the term switches
+      // itself off -- safe, but it gives up the one thing it was added for.
+      //
+      // A fit needs the count to move to identify the slope, which it does:
+      // the controller is nudging every frame.  When it has not moved enough
+      // to be sure (cxx below COV_MIN), k is unidentified and the term says
+      // so rather than guessing.
+      const a = FIT_A;
+      const dx = m.count - st.fitMx, dy = st.frameMs - st.fitMy;
+      st.fitMx += a * dx;
+      st.fitMy += a * dy;
+      st.fitCxx = (1 - a) * (st.fitCxx + a * dx * dx);
+      st.fitCxy = (1 - a) * (st.fitCxy + a * dx * dy);
+      st.fitN++;
+      const span = st.fitMx > 0 ? Math.sqrt(st.fitCxx) / st.fitMx : 0;
+      // A loop that is doing its job stops exciting its own plant: once the
+      // threshold settles the count barely moves, the slope is no longer
+      // identified, and a term that needed a live fit every frame would
+      // switch itself off exactly when it was working.  So the slope is
+      // LEARNED while the count is moving and HELD while it is not.  It only
+      // has to be relearned if what a splat costs actually changes, and that
+      // change is itself what moves the count again.
+      if (st.fitN >= FIT_N && span >= SPAN_MIN && st.fitCxx > 0)
+        st.fitK = Math.max(0, st.fitCxy / st.fitCxx);
+      const k = st.fitK;
+      st.floorMs = st.frameMs - k * m.count;
+      const head = budget - st.floorMs;
+      if (k > 0 && head >= MIN_HEAD) {
+        // The splats' own share of the frame, against the share of the budget
+        // that is actually theirs to spend.  Two-sided, as before.
+        errF = (k * m.count) / head;
+        how = 'gpu';
+      } else if (k <= 0) {
+        how = 'warmup';
+      } else {
+        // Less than MIN_HEAD of the budget is the splats' to give back. The
+        // frame cannot be made by drawing less, so this term has nothing to
+        // say and the walk clock governs -- the old, safe behaviour. The
+        // honest outcome is a scene that is still there and frames that are
+        // late, not an empty screen at a steady 60.
+        how = 'floor';
+      }
     } else {
       // No timer query.  All that is left is the interval, and a vsync-locked
       // frame holds at the period however much headroom is left -- so this can
@@ -204,7 +291,7 @@ export function budgetStep(st, m) {
   if (how === 'interval') st.cliffLs = Math.max(st.cliffLs, st.lodScale);
   if (st.cliffLs > 0) st.lodScale = Math.max(st.lodScale, st.cliffLs);
 
-  st.lodScale = Math.max(0.05, Math.min(1000, st.lodScale));
+  st.lodScale = Math.max(0.05, Math.min(LS_MAX, st.lodScale));
   return st;
 }
 

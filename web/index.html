@@ -416,6 +416,12 @@ try {
     $('bind').textContent = ({
       gpu: 'the frame', interval: 'missed frames', time: 'the walk clock',
       splats: 'the splat ceiling', frozen: 'nothing (frozen)',
+      // The sky, the pool rebuild and the present cost the same however few
+      // splats there are. When that floor alone is most of the frame there is
+      // no headroom to hand the splats, and saying so is more use than a
+      // number: the half-res sky switch is what lowers it.
+      floor: 'the frame floor (try half-res sky)',
+      warmup: 'the walk clock (still measuring the frame)',
     })[v.stats.binding] || '—';
     $('dep').textContent = v.stats.depth;
     $('here').textContent = v.stats.here || '—';

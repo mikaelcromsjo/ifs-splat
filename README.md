@@ -57,9 +57,11 @@ trunk mass fraction, a Sierpinski tetrahedron is four maps with that fraction at
   the traversal reads the table*, which costs +3.8% on the frame.
 - **Spends what it saves.** The level of detail is held by a controller that measures the whole
   frame — the walk's own time, the splat ceiling, and the GPU's, from a timer query — so a cheaper
-  draw turns into more structure instead of an emptier frame. Doubling draw throughput buys 1.50×
-  the splats; the walk itself splits over four threads at 2.15×, splat-for-splat identical to the
-  serial walk.
+  draw turns into more structure instead of an emptier frame. It charges the splats only for the
+  part of the frame that follows the splat count, fitted as `frameMs ~ floor + k·count`, because
+  the sky and the pool rebuild cost the same however few splats there are: halving what a splat
+  costs then buys **2.00×** the splats. The walk itself splits over four threads at 2.15×,
+  splat-for-splat identical to the serial walk.
 - **Flies itself** — a slow autopilot that dives along the attractor's boundary rather than into
   its mass, banks into its turns and climbs back out, under a nebula whose stars are band-limited
   the same way the splats are, so nothing crawls when the scale changes by factors of ten.

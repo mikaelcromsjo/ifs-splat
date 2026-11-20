@@ -789,6 +789,48 @@ The round that followed "look more on optimizations that can be done to increase
 things were costed; four were built, two were argued out of existence with arithmetic that is
 recorded in [IDEAS.md](IDEAS.md) rather than discovered again later.
 
+**What shipped broken, and what it cost to find out.** The first frame term
+divided the whole frame by the budget. That is wrong in a way that destroys the
+scene rather than merely mistuning it: the sky, the pool rebuild, the uniforms
+and the present cost the same whether there are 300k splats or one, so when
+that floor alone exceeds the budget there is no number of splats that satisfies
+the term. The controller pushed the threshold to its clamp of 1000 -- a 900 px
+near threshold -- and the remembered cliff pinned it there. One splat, and a
+detail key that could not win because the loop rewrote the threshold every
+frame. It was reported from a real machine within the hour of being published.
+
+`tests/budget.mjs` had seven scenarios and could not see it, because **every
+one of them modelled frame time as a function of the splat count** -- exactly
+the assumption that fails. A test built from the same belief as the code tests
+the belief, not the code. Scenario 8 now carries a known floor *and* a known
+marginal cost and asks the controller to recover both.
+
+The fix splits the frame: `frameMs ~ floor + k*count`, fitted over a two-second
+leaky window, with the splats' share charged against the share of the budget
+that is actually theirs. Taking the least frame ever seen as the floor was the
+obvious cheap answer and it fails the other way -- the minimum is whatever the
+detail happened to cost when the page opened, so the headroom collapses to
+nothing and the term switches itself off. Safe, and it gives up the one thing
+the term was added for. Three further things fell out of building it:
+
+- **A controlled loop stops exciting its own plant.** Once the threshold
+  settles the count barely moves, the slope is no longer identified, and a
+  term that needed a live fit every frame would switch off exactly when it was
+  working. The slope is learned while the count moves and held while it does
+  not. The price is step response, and it is a direct trade against the window:
+  after a 6x GPU slowdown between one frame and the next, 106 frames to get
+  back inside the budget at a 5 s memory, 75 at 3.3 s, 40 at 2 s, 19 at 1.3 s.
+- **When the floor owns the budget, the right move is to do nothing.** At a
+  15 ms floor against a 14.2 ms budget the term stands down and the walk clock
+  governs: the scene stays, the frames are late. That is the honest outcome --
+  the machine cannot hit the refresh with that sky, and punishing the detail
+  for a cost it does not own is what produced the single splat. The panel says
+  `the frame floor (try half-res sky)`, naming the switch that lowers it.
+- **The clamp matters more than the loop.** 0.9 x 64 = 58 px is coarse but
+  recognisable; 0.9 x 1000 = 900 px is one splat. A bound on how far a
+  controller may go is what makes its worst case survivable, and it would have
+  turned this bug into something merely ugly.
+
 **The one that made the rest matter.** `AdaptiveStream.end()` held its budget on the expansion
 walk's own time and splat count, both measured on the CPU inside the walk — so the controller was
 blind to everything downstream of it, and a cheaper draw bought nothing at all: the walk still
