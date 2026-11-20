@@ -1,4 +1,4 @@
-# Where this got to — 2026-11-17
+# Where this got to — 2026-11-20
 
 Against [PLAN.md](PLAN.md). Everything below was measured, not estimated. **No GPU code has ever
 been run**: installing a headless browser was denied, so there is no WebGL/WebGPU execution,
@@ -28,8 +28,8 @@ and draw order (`py/parity_check.py`); the GLSL math matches the Python referenc
   error at that depth.
 - Cross-fade band gives **~30× fewer visible pops** than a hard cut (`web/tests/pop.mjs`).
 - **LOD fidelity measured against ground truth** (`web/tests/fidelity.mjs`): 25.1–36.4 dB at 2.2–15.0×
-  fewer splats. Sparse sharp structures (lattice, plane, spine) sit at ~26 dB — a Gaussian cannot
-  represent a sharp-edged void. Dense ones reach 35–44 dB.
+  fewer splats. Sparse sharp structures (whirl, sierpinski, lattice) sit at 25–27 dB — a Gaussian
+  cannot represent a sharp-edged void. Dense ones reach 32–36 dB.
 - Blob opacity 0.95 was checked against ground truth rather than guessed: a sweep showed PSNR rises
   monotonically to 0.95, so the murky look of the tree's canopy is the *object*, not the
   approximation — the 900k-splat ground truth is just as murky.
@@ -783,6 +783,90 @@ flight and 78% of it is a fog bank, which is a third of every washed-out frame i
   default: `tests/legible.mjs` measures spatial detail, and a star field behind the splats would
   raise its score without a single splat changing.
 
+## Stage 7 — throughput, done except where it needs root
+
+The round that followed "look more on optimizations that can be done to increase throughput". Six
+things were costed; four were built, two were argued out of existence with arithmetic that is
+recorded in [IDEAS.md](IDEAS.md) rather than discovered again later.
+
+**The one that made the rest matter.** `AdaptiveStream.end()` held its budget on the expansion
+walk's own time and splat count, both measured on the CPU inside the walk — so the controller was
+blind to everything downstream of it, and a cheaper draw bought nothing at all: the walk still
+spent its 6 ms and the frame finished early with the slack thrown away. `web/js/budget.js` is the
+controller now, and it measures the whole frame two ways, because neither alone is enough:
+
+- `EXT_disjoint_timer_query_webgl2` where the driver has it. Two-sided, so spending less on the
+  draw is spent on detail: a doubled draw throughput buys 1.50× the splats.
+- the frame interval otherwise. Vsync-locked, it holds at the refresh period however much headroom
+  is left, so it can only say "there is none" by a frame landing late — a brake that can take
+  detail away and never grant it. With no timer query and frames on time, the controller is
+  bit-identical to the one that shipped.
+
+Two faults in that brake, both found by `web/tests/budget.mjs` and neither visible by reading it:
+driving it from the averaged interval wound up, because the average lags its own time constant, so
+it went on pushing fifteen frames after the frames were on time (36% peak-to-peak on the
+threshold); and without a remembered cliff the loop is grant-miss-retract-grant for ever. It fires
+on discrete missed frames now and leaks its learned cliff downward at 17% a second. 6.1% ripple,
+57 fps on a scene that ran at 20.
+
+The refresh period is observed rather than configured — the running minimum of the intervals,
+recovered to 0.01 ms on a simulated 120 Hz display.
+
+**The vertex shader's projection**, written out instead of left to the matrix operators: J has two
+of six entries structurally zero and S2 is symmetric, so 48 multiplies became 39. It also closed a
+parity gap in the direction nobody expected. Both CPU twins have always computed three entries
+with `b*b` in the determinant; the *GLSL* was the one computing `S2[0][1]` and `S2[1][0]` as
+`w0'Sw1` and `w1'Sw0` — equal because S is symmetric, different products, differently rounded —
+and then multiplying the two together. `web/tests/project.mjs` transcribes both forms and puts the
+disagreement at 1.7e-4 of one **float32** ulp. That test was written asserting bit-identity and
+the assertion was wrong, which is why it is worth having.
+
+**The sky at half resolution**, stretched bilinearly: four exponentials and a nine-tap star hash
+per pixel, for the least detailed thing on the screen, while the splats are only ~2× overdrawn. A
+quarter of its fragments. The lobes and band come through unchanged (0.015/255 mean, 1/255 worst)
+because they were built band-limited on purpose. The stars come out twice as wide — a star's sigma
+is floored at one pixel *of the target it is drawn into* — which is 6.99/255 over the sky and a
+visible change, so it is a switch on the panel and not a silent default. It does not crawl, which
+was the risk: 3.95× the change for a 4× turn against full resolution's 3.91×, at a *lower* worst
+pixel. (`web/tests/space.mjs`)
+
+**The upload**, through a ring of three buffer sets with a VAO each, rather than over contents the
+GPU may still be reading — an implicit synchronisation whose existence depends on a driver
+heuristic that cannot be interrogated from here. `opts.ring: 1` is the old path. The four instance
+streams are now views into one allocation, which is what lets a shard hand a frame over with a
+single transfer. They are **not** interleaved per splat: that was the plan and it is a
+pessimisation, 0.688 cache lines an instance against 0.641, because structure-of-arrays is already
+right for a sequential instanced sweep and the alignment padding costs more than the grouping
+saves.
+
+**The walk, split across threads** — the biggest lever, because the walk is the budgeted resource
+and therefore the only place a saving converts directly into detail. `web/js/shard.js` does the
+split; the disjoint-cell proof is what licenses it (objects may be walked in any order as long as
+their outputs are concatenated in `frames()` order), and the subtlety is that the stream is
+written *backwards*, so the nearest shard has to land at the end of the buffer or the field turns
+inside out.
+
+`web/tests/shard.mjs` is not a benchmark: it walks a scene serially, walks it again over real
+`worker_threads`, and compares the two splat for splat — 48,420 splats, bit-identical in position,
+covariance, colour and effect mask, with the reversed order asserted *not* to match. 1.09× at one
+thread, 1.28× at two, 1.89–2.15× at four, 1.67× at eight, where the dominant object and the
+hand-off take it back.
+
+Four things it found: apparent size is a poor cost proxy (73% of the work on a shard predicted at
+37%; last frame's splat count per object cut the imbalance from 2.93× to 1.45×); minimising the
+largest shard returns fewer shards than threads when one object dominates; all-zero costs — the
+first frame — collapsed to a single shard; and the cold-start walk is 37× the warm one, so the
+first version of the test measured a speedup over V8's compiler.
+
+**What is not done.** In a browser those threads need the shape pool's tables — 288 KB a slot,
+rebuilt 0.46–1.48 times a frame — so they must be shared rather than copied, which needs
+`SharedArrayBuffer`, which needs cross-origin isolation, which needs two nginx headers and
+therefore root. It is task 3 in [root.md](root.md). Replicating the pool per thread instead is not
+an option: its rebuild scheduler is budgeted against the wall clock by design, so two replicas
+diverge. The one-frame-stale double buffer — running the walk for frame N+1 while frame N draws —
+is also not built; it would need the world itself moved into the worker, which takes the J-key
+snapshot and the proof panel with it.
+
 ## Written up
 
 `README.md` now describes the demo and carries a table of what was measured; `IDEAS.md` has a
@@ -852,6 +936,10 @@ node tests/mapset.mjs                     # every set, every pair, and the whole
 node tests/catalogue.mjs                  # all 11 sets, and a morph, as pictures
 node tests/legible.mjs                    # is there anything to SEE, or is it a fog bank
 node tests/order_field.mjs                # draw order in a crowd vs an exact sort
+node tests/budget.mjs                     # the detail controller, on synthetic load
+node tests/project.mjs                    # the shader's projection, both forms, at the last bits
+node tests/shard.mjs 4                    # the walk over four real threads, splat for splat
+node tests/space.mjs                      # the sky, whether its stars crawl, and the half-res one
 node tests/tour.mjs 40 out/f.png 260 200 field   # fly the field
 node tests/tour.mjs 40 out/r.png 260 200 ring    # the old seven, as a regression
 ```

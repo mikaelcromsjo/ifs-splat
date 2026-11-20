@@ -14,7 +14,8 @@
 import { expand, orderFrame, makeScratch } from './ifs_core.js';
 import { ExactSorter } from './sort_exact.js';
 import { InversionCounter } from './inversions.js';
-import { vertexSource, FRAG, BG_VERT, BG_FRAG } from './shaders.js';
+import { vertexSource, FRAG, BG_VERT, BG_FRAG, BLIT_VERT, BLIT_FRAG } from './shaders.js';
+import { GpuClock } from './budget.js';
 import { AdaptiveStream, PALETTES } from './adaptive.js';
 import { World, FieldWorld, VoidCamera, Autopilot, ringLayout } from './world.js';
 import { JumpLog } from './mark.js';
@@ -152,6 +153,10 @@ export class Viewer {
         // fraction of cells that hold one, so the two together set the count;
         // `starAmt` is brightness and 0 turns the whole thing off.
         starAmt: 0.85, starDens: 40.0, starFill: 0.17, starWarm: 0.55,
+        // The resolution the sky is drawn at, as a fraction of the viewport.
+        // 0.5 quarters its fragments; see BLIT_VERT in shaders.js for why
+        // that is honest for the lobes and a visible change for the stars.
+        nebScale: 0.5,
       },
     }, opts);
     // A live, mutable copy: the UI writes straight into this, so a toggle
@@ -189,6 +194,19 @@ export class Viewer {
       if (typeof console !== 'undefined')
         console.warn('nebula background disabled:', this.bgError);
     }
+    // The upsample, for the reduced-resolution sky.  Same bargain as the
+    // background itself: this is unexercised GLSL going out to real drivers,
+    // and a sky is not worth a black page.  If it will not build, the scale
+    // is forced to 1 and the background draws straight to the screen, which
+    // is what it did before this existed.
+    try {
+      this.BLIT = this.BG ? this.makeBlitProgram() : null;
+    } catch (e) {
+      this.BLIT = null;
+      this.blitError = String(e && e.message || e);
+      if (typeof console !== 'undefined')
+        console.warn('reduced-resolution sky disabled:', this.blitError);
+    }
     this.P = this.makeProgram('static');
     this.S = this.makeProgram('stream');
 
@@ -221,6 +239,12 @@ export class Viewer {
     this.jumpLog = new JumpLog({ build: this.opts.build ?? 'dev' });
     this._frames = 0; this._t0 = performance.now(); this._last = this._t0;
     this.keys = new Set();
+    // The GPU's own clock.  Without it the detail controller is blind to
+    // everything after the walk -- see budget.js, which carries the argument.
+    // Absent extension is not an error: the controller falls back to a brake
+    // on the frame interval and behaves as it always did.
+    this.clock = new GpuClock(gl);
+    this._cpuMs = 0;
 
     // Which rung the ladder starts on: whichever one the configured budget
     // asks for, so opts.targetMs stays the single default and this does not
@@ -260,9 +284,86 @@ export class Viewer {
     return { p, u, vao };
   }
 
+  makeBlitProgram() {
+    const gl = this.gl;
+    const p = program(gl, BLIT_VERT, BLIT_FRAG);
+    const u = { uTex: gl.getUniformLocation(p, 'uTex') };
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+    const corner = gl.getAttribLocation(p, 'aCorner');
+    gl.enableVertexAttribArray(corner);
+    gl.vertexAttribPointer(corner, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+    return { p, u, vao };
+  }
+
+  /**
+   * The offscreen target the sky is drawn into, at `w` x `h`.
+   *
+   * RGBA8, deliberately: BG_FRAG writes values already in the range the
+   * canvas holds (the sky's base is 0.04, which is the 10/255 MEASURED.md
+   * counts the background as), so an 8-bit intermediate quantises what was
+   * going to be quantised anyway -- and the bilinear stretch then interpolates
+   * between those levels, which if anything bands less than drawing it at
+   * full resolution would.  No float-render extension needed, so nothing here
+   * depends on a driver feature that might be missing.
+   */
+  nebTarget(w, h) {
+    const gl = this.gl;
+    if (this._nebW === w && this._nebH === h && this._nebFbo) return this._nebFbo;
+    if (this._nebFbo) { gl.deleteFramebuffer(this._nebFbo); gl.deleteTexture(this._nebTex); }
+    const tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    // LINEAR is the whole point: the stretch has to interpolate.
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!ok) {
+      gl.deleteFramebuffer(fbo); gl.deleteTexture(tex);
+      this._nebFbo = null; this._nebW = 0; this._nebH = 0;
+      this.blitError = 'framebuffer incomplete';
+      return null;
+    }
+    this._nebFbo = fbo; this._nebTex = tex; this._nebW = w; this._nebH = h;
+    return fbo;
+  }
+
+  /** What the sky is actually drawn at: 1 unless the scale, the blit program
+   *  and a complete framebuffer are all in hand. */
+  nebScale() {
+    const s = this.look.nebScale ?? 1;
+    if (!this.BLIT || !(s > 0) || s >= 1) return 1;
+    return s;
+  }
+
   drawNebula(b, W, H) {
     const gl = this.gl, L = this.look, G = this.BG;
+    // Reduced resolution, if it is available and asked for.  rW/rH are what
+    // the sky is drawn at and what uStarPx below is derived from -- the floor
+    // on a star's width has to be one pixel of the target it lands in, or the
+    // thing the floor exists to prevent comes straight back.
+    const sc = this.nebScale();
+    let rW = W, rH = H, fbo = null;
+    if (sc < 1) {
+      rW = Math.max(1, Math.round(W * sc));
+      rH = Math.max(1, Math.round(H * sc));
+      fbo = this.nebTarget(rW, rH);
+      if (!fbo) { rW = W; rH = H; }
+    }
     const tanY = Math.tan((this.opts.fovy * Math.PI) / 360);
+    if (fbo) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.viewport(0, 0, rW, rH);
+    }
     gl.useProgram(G.p);
     gl.bindVertexArray(G.vao);
     // view -> world: the splat shader's uRv transposed, so its columns are
@@ -287,13 +388,27 @@ export class Viewer {
     // This is what floors each star's width, so it has to come from the real
     // viewport and not from a guess -- a star sized for a 1080-tall window is
     // a sub-pixel spike on a 4K one, and sub-pixel spikes crawl.
-    gl.uniform1f(G.u.uStarPx, (2 * tanY) / Math.max(H, 1));
+    gl.uniform1f(G.u.uStarPx, (2 * tanY) / Math.max(rH, 1));
     // Opaque, and it must not blend with the clear it is replacing.
     const wasBlend = gl.isEnabled(gl.BLEND);
     gl.disable(gl.BLEND);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (fbo) {
+      // Back to the screen, and stretch.  One texture fetch per pixel against
+      // the four exponentials and nine hash taps it replaces.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, W, H);
+      const B = this.BLIT;
+      gl.useProgram(B.p);
+      gl.bindVertexArray(B.vao);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this._nebTex);
+      gl.uniform1i(B.u.uTex, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
     if (wasBlend) gl.enable(gl.BLEND);
     gl.bindVertexArray(null);
+    this.stats.skyPx = rW * rH;
   }
 
   makeProgram(kind) {
@@ -383,6 +498,30 @@ export class Viewer {
     gl.bindBuffer(gl.ARRAY_BUFFER, this.idxExact);
     gl.bufferData(gl.ARRAY_BUFFER, N * 4, gl.DYNAMIC_DRAW);
 
+    // One VAO per index buffer, built once.
+    //
+    // This used to be three calls inside the draw -- enableVertexAttribArray,
+    // vertexAttribIPointer, vertexAttribDivisor -- re-issued every frame, and
+    // twice a frame with the proof panel open, to say a thing that never
+    // changes.  A VAO exists precisely so that the format of a draw's inputs
+    // is stated once; re-specifying it per frame is per-frame driver work for
+    // no per-frame decision.  The corner buffer comes along with the VAO, so
+    // each of these carries the quad as well as its own index stream.
+    for (const v of this.objVao || []) gl.deleteVertexArray(v);
+    this.objVao = [this.idxOrdered, this.idxExact].map((buf) => {
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+      gl.enableVertexAttribArray(this.P.a.corner);
+      gl.vertexAttribPointer(this.P.a.corner, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.enableVertexAttribArray(this.P.a.splat);
+      gl.vertexAttribIPointer(this.P.a.splat, 1, gl.UNSIGNED_INT, 0, 0);
+      gl.vertexAttribDivisor(this.P.a.splat, 1);
+      gl.bindVertexArray(null);
+      return vao;
+    });
+
     const span = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
     this.cam = new Orbit([0, 0, (lo[2] + hi[2]) / 2], span * 1.05);
     this.span = span;
@@ -404,43 +543,69 @@ export class Viewer {
     this.resetFlight();
 
     const N = this.stream.max;
-    this.bPos = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bPos);
-    gl.bufferData(gl.ARRAY_BUFFER, N * 12, gl.DYNAMIC_DRAW);
-    this.bCov = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCov);
-    gl.bufferData(gl.ARRAY_BUFFER, N * 24, gl.DYNAMIC_DRAW);
-    this.bCol = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCol);
-    gl.bufferData(gl.ARRAY_BUFFER, N * 4, gl.DYNAMIC_DRAW);
-    this.bFx = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bFx);
-    gl.bufferData(gl.ARRAY_BUFFER, N, gl.DYNAMIC_DRAW);
 
+    // A RING of buffer sets, one VAO each.
+    //
+    // The flight re-uploads every splat every frame, into buffers the GPU may
+    // still be reading from for the frame before: a bufferSubData over live
+    // contents is the textbook cause of an implicit synchronisation, where the
+    // driver either stalls until the draw is done or silently renames the
+    // allocation behind your back.  Which of those it does is a driver
+    // decision and there is no GL here to ask.  So the frame writes into a
+    // slot the GPU has demonstrably finished with instead, and the question
+    // does not arise.
+    //
+    // Three deep, because the timer query already shows results landing one
+    // or two frames late, so that is how far behind the GPU can be.  Depth 1
+    // is exactly the old behaviour and is what `opts.ring: 1` asks for.
+    //
+    // It costs VRAM: 41 bytes a splat times maxSplats times the depth, which
+    // at the 400k default is 16.4 MB a slot and 49 MB for three. The CPU side
+    // already holds one of those 16.4 MB, so this is the same order as what
+    // the engine allocates anyway.
+    this.ringN = Math.max(1, (this.opts.ring ?? 3) | 0);
+    this.ringAt = 0;
     const S = this.S;
-    gl.bindVertexArray(S.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bPos);
-    gl.enableVertexAttribArray(S.a.pos);
-    gl.vertexAttribPointer(S.a.pos, 3, gl.FLOAT, false, 12, 0);
-    gl.vertexAttribDivisor(S.a.pos, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCov);
-    gl.enableVertexAttribArray(S.a.covA);
-    gl.vertexAttribPointer(S.a.covA, 3, gl.FLOAT, false, 24, 0);
-    gl.vertexAttribDivisor(S.a.covA, 1);
-    gl.enableVertexAttribArray(S.a.covB);
-    gl.vertexAttribPointer(S.a.covB, 3, gl.FLOAT, false, 24, 12);
-    gl.vertexAttribDivisor(S.a.covB, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCol);
-    gl.enableVertexAttribArray(S.a.color);
-    gl.vertexAttribPointer(S.a.color, 4, gl.UNSIGNED_BYTE, true, 4, 0);
-    gl.vertexAttribDivisor(S.a.color, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bFx);
-    gl.enableVertexAttribArray(S.a.fx);
-    // NOT normalised: the shader wants the byte's value as a bit field, and
-    // normalising would hand it 1/255ths to round back.
-    gl.vertexAttribPointer(S.a.fx, 1, gl.UNSIGNED_BYTE, false, 1, 0);
-    gl.vertexAttribDivisor(S.a.fx, 1);
-    gl.bindVertexArray(null);
+    for (const sl of this.ring || [])
+      { for (const b of sl.b) gl.deleteBuffer(b); gl.deleteVertexArray(sl.vao); }
+    this.ring = [];
+    for (let i = 0; i < this.ringN; i++) {
+      const mk = (bytes) => {
+        const b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, bytes, gl.DYNAMIC_DRAW);
+        return b;
+      };
+      const bPos = mk(N * 12), bCov = mk(N * 24), bCol = mk(N * 4), bFx = mk(N);
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+      gl.enableVertexAttribArray(S.a.corner);
+      gl.vertexAttribPointer(S.a.corner, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bPos);
+      gl.enableVertexAttribArray(S.a.pos);
+      gl.vertexAttribPointer(S.a.pos, 3, gl.FLOAT, false, 12, 0);
+      gl.vertexAttribDivisor(S.a.pos, 1);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bCov);
+      gl.enableVertexAttribArray(S.a.covA);
+      gl.vertexAttribPointer(S.a.covA, 3, gl.FLOAT, false, 24, 0);
+      gl.vertexAttribDivisor(S.a.covA, 1);
+      gl.enableVertexAttribArray(S.a.covB);
+      gl.vertexAttribPointer(S.a.covB, 3, gl.FLOAT, false, 24, 12);
+      gl.vertexAttribDivisor(S.a.covB, 1);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bCol);
+      gl.enableVertexAttribArray(S.a.color);
+      gl.vertexAttribPointer(S.a.color, 4, gl.UNSIGNED_BYTE, true, 4, 0);
+      gl.vertexAttribDivisor(S.a.color, 1);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bFx);
+      gl.enableVertexAttribArray(S.a.fx);
+      // NOT normalised: the shader wants the byte's value as a bit field, and
+      // normalising would hand it 1/255ths to round back.
+      gl.vertexAttribPointer(S.a.fx, 1, gl.UNSIGNED_BYTE, false, 1, 0);
+      gl.vertexAttribDivisor(S.a.fx, 1);
+      gl.bindVertexArray(null);
+      this.ring.push({ vao, b: [bPos, bCov, bCol, bFx] });
+    }
   }
 
   // The two morph switches the panel drives. Accessors rather than fields,
@@ -659,8 +824,23 @@ export class Viewer {
 
   frame() {
     const gl = this.gl, t0 = performance.now();
-    const dt = Math.min((t0 - this._last) / 16.67, 4);     // in 60fps ticks
+    const interval = t0 - this._last;                      // ms, frame to frame
+    const dt = Math.min(interval / 16.67, 4);              // in 60fps ticks
     this._last = t0;
+    // What the detail controller is told, before the walk that reads it.
+    //
+    // All three are LAST frame's: the JS time measured at the bottom of this
+    // method, the timer query's result, which lands a frame or two after the
+    // frame it timed, and the interval just taken.  A controller damped over
+    // tens of frames does not care, and nothing here can know this frame's
+    // cost before doing it.
+    if (this.stream) {
+      const st = this.stream;
+      st.interval = interval;
+      st.cpuMs = this._cpuMs;
+      st.gpuMs = this.clock.ms;
+    }
+    this.clock.begin();
     this.resize();
     const W = this.canvas.width, H = this.canvas.height;
     const f = (H / 2) / Math.tan((this.opts.fovy * Math.PI) / 360);
@@ -677,7 +857,19 @@ export class Viewer {
     if (this.scene === 'void') this.frameFlight(dt, W, H, f);
     else this.frameObject(W, H, f);
 
-    this.stats.frame = performance.now() - t0;
+    this._cpuMs = performance.now() - t0;
+    this.stats.frame = this._cpuMs;
+    // Closing the query is the last GL call of the frame, so it spans every
+    // draw above it.  `gpu` is a frame or two stale and null where the
+    // extension is missing, which the panel shows as a dash rather than a
+    // zero -- a zero would read as "the GPU costs nothing".
+    this.stats.gpu = this.clock.end();
+    const b = this.stream && this.stream.bud;
+    if (b) {
+      this.stats.refresh = b.refreshMs;
+      this.stats.binding = b.binding;
+      this.stats.lodScale = this.stream.lodScale;
+    }
     this._frames++;
     if (t0 - this._t0 > 500) {
       this.stats.fps = (this._frames * 1000) / (t0 - this._t0);
@@ -722,7 +914,6 @@ export class Viewer {
 
     const G = this.P;
     gl.useProgram(G.p);
-    gl.bindVertexArray(G.vao);
     this.setCommonUniforms(G, b, W, H, f);
     gl.uniform1i(G.u.uPos, 0); gl.uniform1i(G.u.uCovA, 1);
     gl.uniform1i(G.u.uCovB, 2); gl.uniform1i(G.u.uCol, 3);
@@ -730,24 +921,23 @@ export class Viewer {
       gl.activeTexture(gl.TEXTURE0 + i);
       gl.bindTexture(gl.TEXTURE_2D, this.tex[i]);
     }
-    const draw = (buf) => {
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.enableVertexAttribArray(G.a.splat);
-      gl.vertexAttribIPointer(G.a.splat, 1, gl.UNSIGNED_INT, 0, 0);
-      gl.vertexAttribDivisor(G.a.splat, 1);
+    const ORDERED = 0, EXACT = 1;
+    const draw = (which) => {
+      gl.bindVertexArray(this.objVao[which]);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, N);
     };
     if (this.proof) {
       const half = (W / 2) | 0;
       gl.enable(gl.SCISSOR_TEST);
       gl.scissor(0, 0, half, H);
-      draw(this.idxExact);                       // left: exact per-splat sort
+      draw(EXACT);                               // left: exact per-splat sort
       gl.scissor(half, 0, W - half, H);
-      draw(this.idxOrdered);                     // right: ordered expansion
+      draw(ORDERED);                             // right: ordered expansion
       gl.disable(gl.SCISSOR_TEST);
     } else {
-      draw(this.mode === 'ordered' ? this.idxOrdered : this.idxExact);
+      draw(this.mode === 'ordered' ? ORDERED : EXACT);
     }
+    gl.bindVertexArray(null);
   }
 
   frameFlight(dt, W, H, f) {
@@ -837,20 +1027,24 @@ export class Viewer {
     if (!n) return;
 
     const o = st.offset;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bPos);
+    this.ringAt = (this.ringAt + 1) % this.ringN;
+    const slot = this.ring[this.ringAt];
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[0]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.pos, 3 * o, 3 * n);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCov);
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[1]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.cov, 6 * o, 6 * n);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bCol);
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[2]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.rgba, 4 * o, 4 * n);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.bFx);
+    gl.bindBuffer(gl.ARRAY_BUFFER, slot.b[3]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, st.fx, o, n);
+    this.stats.upload = n * 41;
 
     const G = this.S;
     gl.useProgram(G.p);
-    gl.bindVertexArray(G.vao);
+    gl.bindVertexArray(slot.vao);
     this.setCommonUniforms(G, { eye: cam.pos, r: cam.r, u: cam.u, f: cam.f }, W, H, f);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+    gl.bindVertexArray(null);
   }
 
   start() {

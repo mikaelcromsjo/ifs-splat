@@ -92,33 +92,66 @@ void main() {
   S[0][0] += px * px; S[1][1] += px * px; S[2][2] += px * px;
 
   float zi = 1.0 / v.z;
-  mat3x2 J = mat3x2( uFocal.x * zi,                 0.0,
-                     0.0,                          -uFocal.y * zi,
-                    -uFocal.x * v.x * zi * zi,      uFocal.y * v.y * zi * zi);
-  mat3x2 W = J * uRv;
-  mat2 S2 = W * S * transpose(W);
+
+  // W = J * uRv, as its two rows, and S2 = W S W^T as its three distinct
+  // entries, written out rather than left to the matrix operators.
+  //
+  // J is a mat3x2 with two of its six entries structurally zero, and S2 is
+  // symmetric.  Spelling both out drops the projection from 48 multiplies to
+  // 39: the general mat3x2 * mat3 spent 18 where 12 are needed, and the
+  // general mat3x2 * mat2x3 computed all four entries of a symmetric 2x2.
+  // That is about a fifth off this expression, which is the honest size of it
+  // -- the 4x saving in here is that all four corners of the quad compute
+  // this identical result, and only a per-splat setup pass fixes that.
+  //
+  // It also CLOSES a parity gap, and fixes a small piece of numerical
+  // sloppiness on the way.  cpu_raster.js, the twin every headless
+  // measurement is made with, has always computed a, b and d -- three
+  // entries, with b*b in the determinant.  The GLSL was the one computing
+  // S2[0][1] and S2[1][0] as w0'Sw1 and w1'Sw0: equal because S is symmetric,
+  // but different products, so rounded differently -- and determinant() then
+  // multiplied the two together.  One entry, squared, is cheaper and better
+  // conditioned.  tests/project.mjs transcribes both forms and puts the
+  // disagreement at 1.7e-4 of one FLOAT32 ulp, which is the precision this
+  // shader has: four orders of magnitude below anything representable here.
+  vec3 w0 =  (uFocal.x * zi)       * vec3(uRv[0][0], uRv[1][0], uRv[2][0])
+          -  (uFocal.x * v.x * zi * zi) * vec3(uRv[0][2], uRv[1][2], uRv[2][2]);
+  vec3 w1 = -(uFocal.y * zi)       * vec3(uRv[0][1], uRv[1][1], uRv[2][1])
+          +  (uFocal.y * v.y * zi * zi) * vec3(uRv[0][2], uRv[1][2], uRv[2][2]);
+  vec3 ws0 = S * w0, ws1 = S * w1;          // S is symmetric: row or column
+  float s00 = dot(ws0, w0), s01 = dot(ws0, w1), s11 = dot(ws1, w1);
 
   // EWA 2D low-pass, with the opacity compensation that keeps a splat's total
   // energy right when it is blurred up to a pixel.
-  float det0 = determinant(S2);
-  S2[0][0] += uLowpass; S2[1][1] += uLowpass;
-  float det1 = determinant(S2);
+  float det0 = s00 * s11 - s01 * s01;
+  s00 += uLowpass; s11 += uLowpass;
+  float det1 = s00 * s11 - s01 * s01;
   if (!(det1 > 0.0)) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
   float comp = sqrt(clamp(max(det0, 0.0) / det1, 0.0, 1.0));
 
-  vConic = vec3(S2[1][1], -S2[0][1], S2[0][0]) / det1;
+  vConic = vec3(s11, -s01, s00) / det1;
 
   // quad in the ellipse's own axes, so elongated rods do not drag a huge
   // axis-aligned box of dead fragments behind them
-  float mid = 0.5 * (S2[0][0] + S2[1][1]);
+  float mid = 0.5 * (s00 + s11);
   float rr  = sqrt(max(mid * mid - det1, 0.0));
   float l1 = mid + rr, l2 = max(mid - rr, 0.02);
-  vec2 ax1 = abs(S2[0][1]) < 1e-9
-           ? (S2[0][0] >= S2[1][1] ? vec2(1.0, 0.0) : vec2(0.0, 1.0))
-           : normalize(vec2(S2[0][1], l1 - S2[0][0]));
-  vec2 ax2 = vec2(ax1.y, -ax1.x);
   float m1 = uCut * sqrt(l1), m2 = uCut * sqrt(l2);
-  vec2 maj = m1 * ax1, mnr = m2 * ax2;
+  // The normalise is folded into the scale: one inversesqrt rather than a
+  // normalize's own sqrt and divide followed by two more multiplies.  Nothing
+  // downstream wants the unit axes themselves -- face comes from the
+  // eigenvalues and vDelta from the vertex that is actually emitted.
+  vec2 maj, mnr;
+  if (abs(s01) < 1e-9) {
+    bool xMajor = s00 >= s11;
+    maj = xMajor ? vec2(m1, 0.0) : vec2(0.0, m1);
+    mnr = xMajor ? vec2(0.0, -m2) : vec2(m2, 0.0);
+  } else {
+    vec2 e = vec2(s01, l1 - s00);
+    float inv = inversesqrt(dot(e, e));
+    maj = (m1 * inv) * e;
+    mnr = (m2 * inv) * vec2(e.y, -e.x);
+  }
 
   vec2 centre = vec2(uFocal.x * v.x * zi + uViewport.x * 0.5,
                      uViewport.y * 0.5 - uFocal.y * v.y * zi);
@@ -296,6 +329,46 @@ export const VERT = vertexSource('static');
 // directions plus one broad band, so every spatial frequency present is one
 // the screen can actually hold still -- band-limited by construction, which
 // is the same reason the splat shader has had anti-aliasing from day one.
+// ---------------------------------------------------------------------------
+// The upsample, for the nebula drawn at reduced resolution.
+//
+// The background is the most expensive fragment work in the engine and the
+// least detailed thing in the picture: three exponential lobes, a band, and a
+// nine-tap star hash, per pixel, at up to twice the device pixel ratio.  The
+// splats are only about 2x overdrawn (MEASURED.md), so this -- not them -- is
+// where fill rate actually goes.
+//
+// It is also the one pass that can be drawn small and stretched without
+// lying, because it was built band-limited on purpose: "every spatial
+// frequency present is one the screen can actually hold still".  Halving the
+// resolution quarters the fragments and a bilinear stretch puts back exactly
+// the frequencies that were there.
+//
+// With ONE exception, which is stars.  A star's width is floored at one
+// pixel of the target it is drawn into (uStarPx), because a sub-pixel spike
+// crawls when the camera moves -- so at half resolution that floor is one
+// half-resolution pixel, and the stars come out twice as wide in angle:
+// bigger and softer, not aliased.  That is a visible change rather than a
+// free one, which is why it is a switch on the panel and not a silent
+// default.
+export const BLIT_VERT = `#version 300 es
+precision highp float;
+in vec2 aCorner;
+out vec2 vUv;
+void main() {
+  vUv = 0.5 + 0.5 * aCorner;
+  gl_Position = vec4(aCorner, 0.0, 1.0);
+}
+`;
+
+export const BLIT_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+in vec2 vUv;
+out vec4 fragColor;
+void main() { fragColor = vec4(texture(uTex, vUv).rgb, 1.0); }
+`;
+
 export const BG_VERT = `#version 300 es
 precision highp float;
 in vec2 aCorner;

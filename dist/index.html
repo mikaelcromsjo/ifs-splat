@@ -83,6 +83,8 @@
     <tr id="rOrd"><td class="k">order</td><td id="ord">—</td></tr>
     <tr id="rEx"><td class="k">exact sort</td><td id="ex">—</td></tr>
     <tr id="rExp"><td class="k">expand</td><td id="exp">—</td></tr>
+    <tr id="rGpu"><td class="k">gpu</td><td id="gpu">—</td></tr>
+    <tr id="rBind"><td class="k">detail held by</td><td id="bind">—</td></tr>
     <tr id="rDep"><td class="k">depth</td><td id="dep">—</td></tr>
     <tr id="rSc"><td class="k">zoom</td><td id="sc">—</td></tr>
     <tr id="rHere"><td class="k">inside</td><td id="here">—</td></tr>
@@ -140,6 +142,7 @@
   <label><input type="checkbox" id="fxRim" checked> rim light</label>
   <label><input type="checkbox" id="fxNeb" checked> nebula</label>
   <label><input type="checkbox" id="fxStar" checked> stars</label>
+  <label><input type="checkbox" id="fxSkyHalf" checked> half-res sky</label>
   <div class="hint" id="fxHint">&nbsp;</div>
   <hr>
   <h2>morph</h2>
@@ -210,7 +213,7 @@ try {
   // box here turns the effect off everywhere no matter what any object asked
   // for.  Ticking it back does not turn it on everywhere -- objects that did
   // not opt in stay plain, which is the point of having the mix.
-  const fxBoxes = ['fxIrid', 'fxRim', 'fxNeb', 'fxStar'];
+  const fxBoxes = ['fxIrid', 'fxRim', 'fxNeb', 'fxStar', 'fxSkyHalf'];
   // The star field's switch is its brightness, not a flag: the shader skips
   // the whole nine-cell loop when it is zero, so off costs nothing.
   const STARS = v.look.starAmt;
@@ -218,9 +221,19 @@ try {
     v.look.mask = ($('fxIrid').checked ? 1 : 0) | ($('fxRim').checked ? 2 : 0);
     v.look.nebula = $('fxNeb').checked;
     v.look.starAmt = $('fxStar').checked ? STARS : 0;
+    // The sky is the most expensive fragment work in the engine -- four
+    // exponentials and a nine-tap star hash per pixel -- and the least
+    // detailed thing in the picture, so it is drawn at half resolution and
+    // stretched. Unticking this draws it at full resolution, which is what it
+    // used to do: the lobes are identical either way because they are
+    // band-limited by construction, and the stars come out half the width,
+    // because a star's floor is one pixel of whatever it is drawn into.
+    v.look.nebScale = $('fxSkyHalf').checked ? 0.5 : 1;
     const on = fxBoxes.filter((id) => $(id).checked).length;
-    $('fxHint').textContent = on === 0
-      ? 'all off — plain palette colour'
+    $('fxHint').textContent = !$('fxNeb').checked
+      ? 'no sky — the flat clear colour, as it was before the nebula'
+      : $('fxSkyHalf').checked
+      ? 'the sky is drawn at half resolution: a quarter of its fragments'
       : 'objects opt in individually; these switch off what they asked for';
   };
   for (const id of fxBoxes) $(id).addEventListener('change', syncFx);
@@ -365,6 +378,7 @@ try {
     show($('rOrd'), !fly);
     show($('rEx'), !fly);
     show($('rExp'), fly);
+    show($('rBind'), fly);
     show($('rDep'), fly);
     show($('rSc'), fly);
     show($('rHere'), fly);
@@ -392,6 +406,17 @@ try {
     $('ord').textContent = v.stats.order ? ms(v.stats.order) : '—';
     $('ex').textContent = v.stats.exact ? ms(v.stats.exact) : '—';
     $('exp').textContent = v.stats.expand ? ms(v.stats.expand) : '—';
+    // The GPU's own time, from EXT_disjoint_timer_query_webgl2, a frame or two
+    // stale. A dash means the extension is not there -- a zero would read as
+    // "the GPU costs nothing", which is the thing the detail controller used
+    // to believe. `detail held by` is which term of that controller is
+    // binding: the walk's clock, the rung's splat ceiling, the measured frame,
+    // or the brake on missed frames when there is no timer query to ask.
+    $('gpu').textContent = v.stats.gpu == null ? '—' : ms(v.stats.gpu);
+    $('bind').textContent = ({
+      gpu: 'the frame', interval: 'missed frames', time: 'the walk clock',
+      splats: 'the splat ceiling', frozen: 'nothing (frozen)',
+    })[v.stats.binding] || '—';
     $('dep').textContent = v.stats.depth;
     $('here').textContent = v.stats.here || '—';
     $('mor').textContent = v.stats.morph ? ms(v.stats.morph) : 'held';

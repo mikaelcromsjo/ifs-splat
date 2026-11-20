@@ -18,6 +18,21 @@ the camera, and the 90 frames before the keypress -- so a moment seen in a brows
 back and replayed offline with `node tests/mark.mjs '<link>'`.  js/mark.js is the live probe
 behind it and js/snapshot.js the packer; both are browser-only code with no node imports.
 
+Republished 2026-11-20 with the throughput round: the detail controller now measures the whole
+frame rather than only the expansion walk, so a cheaper draw turns into more structure instead of
+an emptier frame (js/budget.js is new, and the panel gains `gpu` and `detail held by` rows); the
+vertex shader's projection is written out instead of left to the matrix operators; the object
+scene's two index buffers get a VAO each instead of re-specifying the format every frame; the
+splats upload through a ring of three buffer sets rather than over contents the GPU may still be
+reading; and the sky is drawn at half resolution and stretched, which is a quarter of its
+fragments and is the new `half-res sky` switch on the panel -- the lobes are unchanged by it and
+the stars come out twice as wide, so it is a switch and not a silent default.
+
+js/shard.js is NOT published: it splits the expansion walk across threads, and in a browser that
+needs SharedArrayBuffer and therefore cross-origin isolation, which is two nginx headers and
+task 3 in root.md. Nothing in the page imports it yet, so it stays out on the same terms as the
+modules below.
+
 The published copy no longer carries cpu_raster.js, gpu_ref.js or calibrate.js: they had been
 copied up with the rest on the first publish, and cpu_raster.js imports node:zlib, so a browser
 that ever loaded it would have failed.  Nothing references them; they are removed.
